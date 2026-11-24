@@ -20,8 +20,6 @@ internal static class FseInputDiagHost
 {
     internal const string BaseSha = "0a0a13b937ed987a131a0729226a03de374e7d91";
     private const string ArmFileName = "fse-input-diag.arm";
-    private const string SampleFileName = "fse-input-diag.jsonl";
-    private const string SummaryFileName = "fse-input-diag.summary.txt";
 
     [ThreadStatic] private static uint t_frame;
     [ThreadStatic] private static FrameBag? t_bag;
@@ -33,6 +31,7 @@ internal static class FseInputDiagHost
     private static string? _directory;
     private static int _armBusy;
     private static int _started;
+    private static string? _notedSession;
     private static int _frameSeq;
 
     public static bool IsFrameOpen
@@ -330,12 +329,25 @@ internal static class FseInputDiagHost
             try
             {
                 Thread.Sleep(300);
-                if (!TryConsumeArm(out string text) || _session is not { } session || !session.TryArm(text, BaseSha))
+                FseInputDiagSession? session = _session;
+                string directory = _directory ?? string.Empty;
+                if (session is null || string.IsNullOrEmpty(directory))
                 {
                     Interlocked.Exchange(ref _armBusy, 0);
                     return;
                 }
 
+                string decision = DiagFiles.ConsumeAfterAccept(directory, session, BaseSha);
+                if (decision != "accepted")
+                {
+                    if (decision != "no_arm")
+                        WriteStatus("arm=rejected\nreason=" + decision);
+                    Interlocked.Exchange(ref _armBusy, 0);
+                    return;
+                }
+
+                _notedSession = null;
+                WriteStatus("arm=accepted");
                 StartPump();
                 try
                 {
@@ -351,41 +363,6 @@ internal static class FseInputDiagHost
                 Interlocked.Exchange(ref _armBusy, 0);
             }
         });
-    }
-
-    private static bool TryConsumeArm(out string text)
-    {
-        text = string.Empty;
-        try
-        {
-            if (string.IsNullOrEmpty(_directory))
-                return false;
-            string path = Path.Combine(_directory, ArmFileName);
-            if (!File.Exists(path))
-                return false;
-
-            byte[] buffer = new byte[64];
-            using (FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            {
-                int read = stream.Read(buffer, 0, buffer.Length);
-                text = System.Text.Encoding.ASCII.GetString(buffer, 0, read);
-            }
-
-            try
-            {
-                File.Delete(path);
-            }
-            catch
-            {
-                // A leftover arm file is ignored while this capture is busy.
-            }
-
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     private static void StartPump()
@@ -415,8 +392,25 @@ internal static class FseInputDiagHost
             if (session is null)
                 return;
             session.Pump();
+            if (session.OpenFault == "open_failed" && _notedSession != "open_failed")
+            {
+                _notedSession = "open_failed";
+                WriteStatus("arm=open_failed\nhresult=" + session.OpenHResult.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else if (session.State == DiagSessionState.Capturing && session.SessionId.Length > 0 && _notedSession != session.SessionId)
+            {
+                _notedSession = session.SessionId;
+                WriteStatus("arm=capturing\nsession=" + session.SessionId + "\nutcStart=" + session.UtcStart);
+            }
             if (session.State is DiagSessionState.Finished or DiagSessionState.Idle)
             {
+                if (session.State == DiagSessionState.Finished && session.SessionId.Length > 0)
+                {
+                    WriteStatus(
+                        "arm=finished\nreason=" + session.FinishReason +
+                        "\nsession=" + session.SessionId +
+                        "\nutcStart=" + session.UtcStart);
+                }
                 Interlocked.Exchange(ref _armBusy, 0);
                 try
                 {
@@ -436,10 +430,21 @@ internal static class FseInputDiagHost
 
     private static DiagStreams OpenStreams()
     {
-        string directory = _directory ?? ".";
-        FileStream samples = new(Path.Combine(directory, SampleFileName), FileMode.Create, FileAccess.Write, FileShare.Read, 65536, FileOptions.SequentialScan);
-        FileStream summary = new(Path.Combine(directory, SummaryFileName), FileMode.Create, FileAccess.Write, FileShare.Read, 4096, FileOptions.SequentialScan);
-        return new DiagStreams(samples, summary);
+        return DiagFiles.Open(_directory ?? ".");
+    }
+
+    private static void WriteStatus(string text)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_directory))
+                return;
+            DiagFiles.WriteStatus(_directory, text);
+        }
+        catch
+        {
+            // Status is optional and must not affect input.
+        }
     }
 
     private static long NowMs()

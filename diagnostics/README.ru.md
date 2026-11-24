@@ -55,6 +55,9 @@ dotnet build HandheldCompanion.sln -c Release -p:DiagnosticNoUiAccess=true
 
 - `%LocalAppData%\HandheldCompanion\fse-input-diag.jsonl`
 - `%LocalAppData%\HandheldCompanion\fse-input-diag.summary.txt`
+- `%LocalAppData%\HandheldCompanion\fse-input-diag.status.txt`
+
+Заголовок журнала версии 2 содержит `sid` и абсолютный `utc` старта захвата. Подвал содержит `sid` и `utc` конца. Файл статуса — несколько строк `arm=accepted`, `arm=rejected` с `reason` (`busy`, `writer_alive`, `error`) или `arm=finished` / `arm=open_failed`. В нём нет путей, имён и заголовков окон. Пока там нет нового `sid`, повторный захват не начался: старый JSONL мог остаться от предыдущего сеанса. Новый сеанс не продлевает уже закрытые 30 секунд.
 
 Полный путь содержит имя пользователя, поэтому в сами файлы он не пишется.
 

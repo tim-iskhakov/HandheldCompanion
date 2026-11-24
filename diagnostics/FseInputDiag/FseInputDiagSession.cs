@@ -40,6 +40,11 @@ public sealed class FseInputDiagSession
     private int _headerWritten;
     private int _footerWritten;
     private string _baseSha = "";
+    private string _sessionId = "";
+    private string _utcStart = "";
+    private string _lastArmReject = "";
+    private string _openFault = "";
+    private int _openHResult;
 
     public FseInputDiagSession(DiagLimits? limits, Func<long> nowMs, Func<DiagStreams> open, bool backgroundWriter)
     {
@@ -62,6 +67,12 @@ public sealed class FseInputDiagSession
     public int EffectiveMaxQueue => _maxQueue;
     public long CaptureDeadlineMs => Volatile.Read(ref _captureDeadline);
     public long ArmDeadlineMs => Volatile.Read(ref _armDeadline);
+    public string SessionId => _sessionId;
+    public string UtcStart => _utcStart;
+    public string LastArmReject => _lastArmReject;
+    public string OpenFault => _openFault;
+    public int OpenHResult => _openHResult;
+    public string FinishReason => _reason;
 
     public long ElapsedMs()
     {
@@ -85,12 +96,21 @@ public sealed class FseInputDiagSession
             lock (_sync)
             {
                 if (State is DiagSessionState.Armed or DiagSessionState.Capturing)
+                {
+                    _lastArmReject = "busy";
                     return false;
+                }
                 if (_writer is { IsAlive: true })
+                {
+                    _lastArmReject = "writer_alive";
                     return false;
+                }
 
                 ResetUnlocked();
                 _baseSha = baseSha ?? "";
+                _lastArmReject = "";
+                _openFault = "";
+                _openHResult = 0;
                 Volatile.Write(ref _armDeadline, SafeNow() + delay);
                 Volatile.Write(ref _state, (int)DiagSessionState.Armed);
                 return true;
@@ -98,6 +118,7 @@ public sealed class FseInputDiagSession
         }
         catch
         {
+            _lastArmReject = "error";
             return false;
         }
     }
@@ -206,6 +227,7 @@ public sealed class FseInputDiagSession
                 Flush();
             else
                 _writer?.Join(TimeSpan.FromMilliseconds(500));
+            ReleaseFiles();
         }
         catch
         {
@@ -217,6 +239,8 @@ public sealed class FseInputDiagSession
     {
         Volatile.Write(ref _captureStart, now);
         Volatile.Write(ref _captureDeadline, now + _durationMs);
+        _sessionId = Guid.NewGuid().ToString("N");
+        _utcStart = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture);
         _reason = "duration";
         Volatile.Write(ref _state, (int)DiagSessionState.Capturing);
         if (_backgroundWriter)
@@ -238,8 +262,13 @@ public sealed class FseInputDiagSession
                 WriteSample(sample);
             WriteFooterOnce();
         }
-        catch
+        catch (Exception ex)
         {
+            if (_samples is null)
+            {
+                _openFault = "open_failed";
+                _openHResult = ex.HResult;
+            }
             Volatile.Write(ref _bytesExhausted, 1);
             try
             {
@@ -250,6 +279,10 @@ public sealed class FseInputDiagSession
             {
                 // Ignore a queue that was already completed.
             }
+        }
+        finally
+        {
+            ReleaseFiles();
         }
     }
 
@@ -318,11 +351,13 @@ public sealed class FseInputDiagSession
             return;
 
         string line =
-            "{\"kind\":\"header\",\"v\":1,\"base\":\"" + SafeSha(_baseSha) +
-            "\",\"maxMs\":" + _durationMs.ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"maxSamples\":" + _maxSamples.ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"maxBytes\":" + _maxBytes.ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"maxQueue\":" + _maxQueue.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
+            "{\"kind\":\"header\",\"v\":2,\"sid\":\"" + SafeSha(_sessionId) +
+            "\",\"utc\":\"" + SafeUtc(_utcStart) +
+            "\",\"base\":\"" + SafeSha(_baseSha) +
+            "\",\"maxMs\":" + _durationMs.ToString(CultureInfo.InvariantCulture) +
+            ",\"maxSamples\":" + _maxSamples.ToString(CultureInfo.InvariantCulture) +
+            ",\"maxBytes\":" + _maxBytes.ToString(CultureInfo.InvariantCulture) +
+            ",\"maxQueue\":" + _maxQueue.ToString(CultureInfo.InvariantCulture) + "}";
         int bytes = Encoding.UTF8.GetByteCount(line) + 1;
         if (bytes > _maxBytes)
         {
@@ -351,12 +386,14 @@ public sealed class FseInputDiagSession
         string reason = string.IsNullOrEmpty(_reason) ? "stop" : _reason;
         string line =
             "{\"kind\":\"footer\",\"reason\":\"" + reason +
-            "\",\"written\":" + Volatile.Read(ref _written).ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"bytes\":" + Volatile.Read(ref _writtenBytes).ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"queueDrops\":" + Volatile.Read(ref _queueDrops).ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"sampleDrops\":" + Volatile.Read(ref _sampleDrops).ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"byteDrops\":" + Volatile.Read(ref _byteDrops).ToString(System.Globalization.CultureInfo.InvariantCulture) +
-            ",\"elapsedMs\":" + elapsed.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
+            "\",\"sid\":\"" + SafeSha(_sessionId) +
+            "\",\"utc\":\"" + SafeUtc(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", CultureInfo.InvariantCulture)) +
+            "\",\"written\":" + Volatile.Read(ref _written).ToString(CultureInfo.InvariantCulture) +
+            ",\"bytes\":" + Volatile.Read(ref _writtenBytes).ToString(CultureInfo.InvariantCulture) +
+            ",\"queueDrops\":" + Volatile.Read(ref _queueDrops).ToString(CultureInfo.InvariantCulture) +
+            ",\"sampleDrops\":" + Volatile.Read(ref _sampleDrops).ToString(CultureInfo.InvariantCulture) +
+            ",\"byteDrops\":" + Volatile.Read(ref _byteDrops).ToString(CultureInfo.InvariantCulture) +
+            ",\"elapsedMs\":" + elapsed.ToString(CultureInfo.InvariantCulture) + "}";
 
         int bytes = Encoding.UTF8.GetByteCount(line) + 1;
         if (Volatile.Read(ref _writtenBytes) <= _maxBytes - bytes)
@@ -379,7 +416,9 @@ public sealed class FseInputDiagSession
             _summary.WriteLine("queueDrops=" + Volatile.Read(ref _queueDrops).ToString(System.Globalization.CultureInfo.InvariantCulture));
             _summary.WriteLine("sampleDrops=" + Volatile.Read(ref _sampleDrops).ToString(System.Globalization.CultureInfo.InvariantCulture));
             _summary.WriteLine("byteDrops=" + Volatile.Read(ref _byteDrops).ToString(System.Globalization.CultureInfo.InvariantCulture));
-            _summary.WriteLine("elapsedMs=" + elapsed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            _summary.WriteLine("sid=" + SafeSha(_sessionId));
+            _summary.WriteLine("utcStart=" + SafeUtc(_utcStart));
+            _summary.WriteLine("elapsedMs=" + elapsed.ToString(CultureInfo.InvariantCulture));
             _summary.Flush();
         }
     }
@@ -388,9 +427,7 @@ public sealed class FseInputDiagSession
     {
         CompleteQueue();
         _queue = new BlockingCollection<DiagSample>(_maxQueue);
-        _output = null;
-        _samples = null;
-        _summary = null;
+        ReleaseFiles();
         _writer = null;
         Volatile.Write(ref _armDeadline, 0);
         Volatile.Write(ref _captureStart, 0);
@@ -430,6 +467,35 @@ public sealed class FseInputDiagSession
         {
             return 0;
         }
+    }
+
+    private void ReleaseFiles()
+    {
+        StreamWriter? samples = _samples;
+        StreamWriter? summary = _summary;
+        DiagStreams? output = _output;
+        _samples = null;
+        _summary = null;
+        _output = null;
+        try { samples?.Flush(); } catch { }
+        try { summary?.Flush(); } catch { }
+        try { samples?.Dispose(); } catch { }
+        try { summary?.Dispose(); } catch { }
+        try { output?.Dispose(); } catch { }
+    }
+
+    private static string SafeUtc(string value)
+    {
+        var sb = new StringBuilder(value.Length);
+        foreach (char c in value)
+        {
+            if (c is >= '0' and <= '9' or '-' or ':' or '.' or 'T' or 'Z')
+                sb.Append(c);
+            if (sb.Length == 32)
+                break;
+        }
+
+        return sb.ToString();
     }
 
     private static string SafeSha(string sha)

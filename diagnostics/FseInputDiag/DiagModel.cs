@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 
 namespace FseInputDiag;
 
@@ -145,18 +146,100 @@ public sealed class DiagSample
 
 public sealed class DiagStreams : IDisposable
 {
-    public DiagStreams(Stream samples, Stream summary)
+    public DiagStreams(Stream samples, Stream summary, bool ownsStreams = false)
     {
         Samples = samples;
         Summary = summary;
+        OwnsStreams = ownsStreams;
     }
 
     public Stream Samples { get; }
     public Stream Summary { get; }
+    public bool OwnsStreams { get; }
 
     public void Dispose()
     {
-        Samples.Dispose();
-        Summary.Dispose();
+        if (!OwnsStreams)
+            return;
+        try { Samples.Dispose(); } catch { }
+        try { Summary.Dispose(); } catch { }
+    }
+}
+
+public static class DiagFiles
+{
+    public const string ArmFileName = "fse-input-diag.arm";
+    public const string SampleFileName = "fse-input-diag.jsonl";
+    public const string SummaryFileName = "fse-input-diag.summary.txt";
+    public const string StatusFileName = "fse-input-diag.status.txt";
+
+    public static DiagStreams Open(string directory)
+    {
+        FileStream samples = new(Path.Combine(directory, SampleFileName), FileMode.Create, FileAccess.Write, FileShare.Read, 65536, FileOptions.SequentialScan);
+        FileStream summary = new(Path.Combine(directory, SummaryFileName), FileMode.Create, FileAccess.Write, FileShare.Read, 4096, FileOptions.SequentialScan);
+        return new DiagStreams(samples, summary, ownsStreams: true);
+    }
+
+    public static bool TryReadArm(string directory, out string text)
+    {
+        text = string.Empty;
+        try
+        {
+            string path = Path.Combine(directory, ArmFileName);
+            if (!File.Exists(path))
+                return false;
+            byte[] buffer = new byte[64];
+            using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            int read = stream.Read(buffer, 0, buffer.Length);
+            text = Encoding.ASCII.GetString(buffer, 0, read);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static void DeleteArm(string directory)
+    {
+        try
+        {
+            File.Delete(Path.Combine(directory, ArmFileName));
+        }
+        catch
+        {
+            // A locked arm file is reported by the status line instead.
+        }
+    }
+
+    public static string ConsumeAfterAccept(string directory, FseInputDiagSession session, string baseSha)
+    {
+        if (!TryReadArm(directory, out string text))
+            return "no_arm";
+        if (!session.TryArm(text, baseSha))
+        {
+            string reason = session.LastArmReject;
+            if (string.IsNullOrEmpty(reason))
+                reason = "rejected";
+            DeleteArm(directory);
+            return reason;
+        }
+
+        DeleteArm(directory);
+        return "accepted";
+    }
+
+    public static void WriteStatus(string directory, string text)
+    {
+        var sb = new StringBuilder(Math.Min(text.Length, 480));
+        foreach (char c in text)
+        {
+            if (sb.Length == 480)
+                break;
+            if (c is '\n' or >= ' ' and <= '~')
+                sb.Append(c);
+        }
+
+        File.WriteAllText(Path.Combine(directory, StatusFileName), sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     }
 }

@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using FseInputDiag;
@@ -256,6 +257,67 @@ public class SessionTests
         Assert.Equal(decision, send.GetProperty("decision").GetString());
         Assert.Equal(raw.GetProperty("ms").GetInt64(), map.GetProperty("ms").GetInt64());
         Assert.Equal(raw.GetProperty("ms").GetInt64(), send.GetProperty("ms").GetInt64());
+    }
+
+    [Fact]
+    public void HostRearmReleasesTheFileAndStartsAFreshCapture()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "fse-rearm-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            long now = 0;
+            var session = new FseInputDiagSession(new DiagLimits(), () => now, () => DiagFiles.Open(directory), backgroundWriter: true);
+            File.WriteAllText(Path.Combine(directory, DiagFiles.ArmFileName), "20");
+            Assert.Equal("accepted", DiagFiles.ConsumeAfterAccept(directory, session, Sha));
+            Assert.False(File.Exists(Path.Combine(directory, DiagFiles.ArmFileName)));
+            now = session.ArmDeadlineMs;
+            session.Pump();
+            long firstDeadline = session.CaptureDeadlineMs;
+            Assert.Equal(now + DiagLimits.HardMaxDurationMs, firstDeadline);
+            Assert.True(session.TryEnqueue(Send(1, DiagSendDecision.Sent)));
+            File.WriteAllText(Path.Combine(directory, DiagFiles.ArmFileName), "20");
+            Assert.Equal("busy", DiagFiles.ConsumeAfterAccept(directory, session, Sha));
+            Assert.Equal(firstDeadline, session.CaptureDeadlineMs);
+            Assert.False(File.Exists(Path.Combine(directory, DiagFiles.ArmFileName)));
+            now = firstDeadline;
+            session.Pump();
+            session.Stop();
+
+            string firstPath = Path.Combine(directory, DiagFiles.SampleFileName);
+            string first = File.ReadAllText(firstPath);
+            Assert.Contains("\"v\":2", first);
+            Assert.Contains("\"utc\":", first);
+            string sid1 = session.SessionId;
+            Assert.Contains(sid1, first);
+            using (FileStream probe = new(firstPath, FileMode.Open, FileAccess.Write, FileShare.Read))
+            {
+                Assert.True(probe.CanWrite);
+            }
+
+            File.WriteAllText(Path.Combine(directory, DiagFiles.ArmFileName), "20");
+            Assert.Equal("accepted", DiagFiles.ConsumeAfterAccept(directory, session, Sha));
+            Assert.Equal(0, session.CaptureDeadlineMs);
+            now = session.ArmDeadlineMs;
+            session.Pump();
+            Assert.Equal(now + DiagLimits.HardMaxDurationMs, session.CaptureDeadlineMs);
+            Assert.NotEqual(firstDeadline, session.CaptureDeadlineMs);
+            Assert.True(session.TryEnqueue(Send(2, DiagSendDecision.Unchanged)));
+            now = session.CaptureDeadlineMs;
+            session.Pump();
+            session.Stop();
+
+            string second = File.ReadAllText(firstPath);
+            Assert.DoesNotContain(sid1, second);
+            Assert.Contains(session.SessionId, second);
+            Assert.Contains("\"f\":2", second);
+            Assert.DoesNotContain("\"f\":1", second);
+            Assert.Contains("\"maxMs\":30000", second);
+        }
+        finally
+        {
+            try { Directory.Delete(directory, true); } catch { }
+        }
     }
 
     private static DiagSample Send(uint frame, DiagSendDecision decision) => new()
