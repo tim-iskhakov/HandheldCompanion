@@ -1,4 +1,6 @@
+using FseInputDiag;
 using HandheldCompanion.Controllers;
+using HandheldCompanion.Diagnostics;
 using HandheldCompanion.Shared;
 using HandheldCompanion.Utils;
 using System;
@@ -90,7 +92,11 @@ namespace HandheldCompanion.Targets
         public virtual void UpdateInputs(ControllerState inputs, GamepadMotion gamepadMotion)
         {
             if (!IsConnected)
+            {
+                if (FseInputDiagHost.IsFrameOpen)
+                    FseInputDiagHost.NoteSend(DiagSendDecision.Disconnected);
                 return;
+            }
 
             try
             {
@@ -98,8 +104,18 @@ namespace HandheldCompanion.Targets
             }
             catch (Exception ex)
             {
+                try
+                {
+                    if (FseInputDiagHost.IsFrameOpen)
+                        FseInputDiagHost.NoteSend(DiagSendDecision.SendError);
+                }
+                catch { }
                 LogManager.LogError(ex.Message);
+                return;
             }
+
+            if (FseInputDiagHost.IsFrameOpen)
+                FseInputDiagHost.NoteSend(DiagSendDecision.Sent);
         }
 
         protected virtual byte[] BuildReport(ControllerState inputs, GamepadMotion gamepadMotion)

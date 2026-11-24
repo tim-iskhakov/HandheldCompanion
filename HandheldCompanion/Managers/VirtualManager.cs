@@ -1,4 +1,6 @@
+using FseInputDiag;
 using HandheldCompanion.Controllers;
+using HandheldCompanion.Diagnostics;
 using HandheldCompanion.Inputs;
 using HandheldCompanion.Notifications;
 using HandheldCompanion.Shared;
@@ -683,10 +685,18 @@ namespace HandheldCompanion.Managers
         {
             // Skip sending inputs to virtual controller when listening for hotkey inputs
             if (InputsManager.IsListening)
+            {
+                if (FseInputDiagHost.IsFrameOpen)
+                    FseInputDiagHost.NoteSend(DiagSendDecision.Listening);
                 return;
+            }
 
             if (isSystemSleeping)
+            {
+                if (FseInputDiagHost.IsFrameOpen)
+                    FseInputDiagHost.NoteSend(DiagSendDecision.Sleep);
                 return;
+            }
 
             // Deduplicate: skip if controller state hasn't changed meaningfully
             if (prevControllerState is not null)
@@ -696,8 +706,15 @@ namespace HandheldCompanion.Managers
                 bool gyroChanged = GyroStateHasSignificantChange(prevControllerState.GyroState, controllerState.GyroState);
 
                 if (!buttonChanged && !axisChanged && !gyroChanged)
+                {
+                    if (FseInputDiagHost.IsFrameOpen)
+                        FseInputDiagHost.NoteSend(DiagSendDecision.Unchanged);
                     return; // No significant change, skip update
+                }
             }
+
+            if (vTarget is null && FseInputDiagHost.IsFrameOpen)
+                FseInputDiagHost.NoteSend(DiagSendDecision.NullTarget);
 
             vTarget?.UpdateInputs(controllerState, gamepadMotion);
 

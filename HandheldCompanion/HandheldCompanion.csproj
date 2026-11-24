@@ -273,6 +273,11 @@
 		<PackageReference Include="YamlDotNet" Version="18.1.0" />
 	</ItemGroup>
 	<ItemGroup>
+		<Compile Include="..\diagnostics\FseInputDiag\DiagModel.cs" Link="Diagnostics\Portable\DiagModel.cs" />
+		<Compile Include="..\diagnostics\FseInputDiag\DiagText.cs" Link="Diagnostics\Portable\DiagText.cs" />
+		<Compile Include="..\diagnostics\FseInputDiag\FseInputDiagSession.cs" Link="Diagnostics\Portable\FseInputDiagSession.cs" />
+	</ItemGroup>
+	<ItemGroup>
 		<ProjectReference Include="..\controller-hidapi.net\controller-hidapi.net.csproj" />
 		<ProjectReference Include="..\hidapi.net\hidapi.net.csproj" />
 		<ProjectReference Include="..\Shared\Shared.csproj" />
