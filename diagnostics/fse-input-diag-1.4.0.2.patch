@@ -1,0 +1,2404 @@
+diff --git a/HandheldCompanion/Controllers/SDLController.cs b/HandheldCompanion/Controllers/SDLController.cs
+index 27c349e06ae07ba5eb8df9428a518b3a1dc7a3c3..ffe900cd008359f31c82d62f41e71b74799f15d1 100644
+--- a/HandheldCompanion/Controllers/SDLController.cs
++++ b/HandheldCompanion/Controllers/SDLController.cs
+@@ -1,3 +1,5 @@
++using FseInputDiag;
++using HandheldCompanion.Diagnostics;
+ using HandheldCompanion.Inputs;
+ using HandheldCompanion.Utils;
+ using System;
+@@ -264,8 +266,21 @@ namespace HandheldCompanion.Controllers
+ 
+         public override void Tick(long ticks, float delta, bool commit)
+         {
+-            if (!IsConnected() || Inputs is null || IsBusy || !IsPlugged || _disposing || _disposed)
++            bool connected = IsConnected();
++            if (!connected || Inputs is null || IsBusy || !IsPlugged || _disposing || _disposed)
++            {
++                if (FseInputDiagHost.IsFrameOpen)
++                {
++                    DiagSkipReason reason = !connected
++                        ? DiagSkipReason.NotConnected
++                        : Inputs is null ? DiagSkipReason.InputsNull
++                        : IsBusy ? DiagSkipReason.Busy
++                        : !IsPlugged ? DiagSkipReason.NotPlugged
++                        : DiagSkipReason.Disposing;
++                    FseInputDiagHost.NoteRaw(this, DiagReadResult.Skipped, 0, reason);
++                }
+                 return;
++            }
+ 
+             ButtonState.Overwrite(InjectedButtons, Inputs.ButtonState);
+ 
+@@ -408,6 +423,8 @@ namespace HandheldCompanion.Controllers
+                 gamepadMotion.ProcessMotion(gX, gY, gZ, aX, aY, aZ, delta);
+ 
+             base.Tick(ticks, delta);
++            if (FseInputDiagHost.IsFrameOpen)
++                FseInputDiagHost.NoteRaw(this, DiagReadResult.Ok, 0, DiagSkipReason.None);
+         }
+ 
+         public override string GetGlyph(ButtonFlags button)
+diff --git a/HandheldCompanion/Controllers/XInputController.cs b/HandheldCompanion/Controllers/XInputController.cs
+index 39acbb94553a1e64878e527c1aa74f26b8784d17..a64af4d0dfabd012d858659f2f9ea20d87313e6d 100644
+--- a/HandheldCompanion/Controllers/XInputController.cs
++++ b/HandheldCompanion/Controllers/XInputController.cs
+@@ -1,3 +1,5 @@
++using FseInputDiag;
++using HandheldCompanion.Diagnostics;
+ using HandheldCompanion.Inputs;
+ using SharpDX.XInput;
+ using System;
+@@ -72,7 +74,18 @@ public class XInputController : IController, IXInputController
+     public override void Tick(long ticks, float delta, bool commit)
+     {
+         if (Inputs is null || IsBusy || !IsPlugged || _disposing || _disposed)
++        {
++            if (FseInputDiagHost.IsFrameOpen)
++            {
++                DiagSkipReason reason = Inputs is null
++                    ? DiagSkipReason.InputsNull
++                    : IsBusy ? DiagSkipReason.Busy
++                    : !IsPlugged ? DiagSkipReason.NotPlugged
++                    : DiagSkipReason.Disposing;
++                FseInputDiagHost.NoteRaw(this, DiagReadResult.Skipped, 0, reason);
++            }
+             return;
++        }
+ 
+         if (!commit)
+             UpdateState();
+@@ -85,7 +98,11 @@ public class XInputController : IController, IXInputController
+         ButtonState.Overwrite(InjectedButtons, Inputs.ButtonState);
+ 
+         if (Controller is null)
++        {
++            if (FseInputDiagHost.IsFrameOpen)
++                FseInputDiagHost.NoteRaw(this, DiagReadResult.NullController, 0, DiagSkipReason.None);
+             return false;
++        }
+ 
+         try
+         {
+@@ -129,10 +146,18 @@ public class XInputController : IController, IXInputController
+             Inputs.AxisState[AxisFlags.L2] = Gamepad.LeftTrigger;
+             Inputs.AxisState[AxisFlags.R2] = Gamepad.RightTrigger;
+ 
++            if (FseInputDiagHost.IsFrameOpen)
++                FseInputDiagHost.NoteRaw(this, DiagReadResult.Ok, 0, DiagSkipReason.None);
+             return true;
+         }
+-        catch
++        catch (Exception ex)
+         {
++            try
++            {
++                if (FseInputDiagHost.IsFrameOpen)
++                    FseInputDiagHost.NoteRaw(this, DiagReadResult.Failed, ex.HResult, DiagSkipReason.None);
++            }
++            catch { }
+             return false;
+         }
+     }
+diff --git a/HandheldCompanion/Diagnostics/FseInputDiagHost.cs b/HandheldCompanion/Diagnostics/FseInputDiagHost.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f995ffd61ff4493ff6b85e03ec22b5d3ee893d2
+--- /dev/null
++++ b/HandheldCompanion/Diagnostics/FseInputDiagHost.cs
+@@ -0,0 +1,619 @@
++using FseInputDiag;
++using HandheldCompanion.Controllers;
++using HandheldCompanion.Controllers.SDL;
++using HandheldCompanion.Inputs;
++using HandheldCompanion.Managers;
++using HandheldCompanion.Shared;
++using System;
++using System.Diagnostics;
++using System.IO;
++using System.Runtime.CompilerServices;
++using System.Threading;
++
++namespace HandheldCompanion.Diagnostics;
++
++/// <summary>
++/// Opt-in, time-boxed trace of one controller tick. Disabled until an arm file appears.
++/// Hooks must stay allocation-free and side-effect free while no frame is open.
++/// </summary>
++internal static class FseInputDiagHost
++{
++    internal const string BaseSha = "0a0a13b937ed987a131a0729226a03de374e7d91";
++    private const string ArmFileName = "fse-input-diag.arm";
++    private const string SampleFileName = "fse-input-diag.jsonl";
++    private const string SummaryFileName = "fse-input-diag.summary.txt";
++
++    [ThreadStatic] private static uint t_frame;
++    [ThreadStatic] private static FrameBag? t_bag;
++
++    private static readonly long Frequency = Stopwatch.Frequency;
++    private static FseInputDiagSession? _session;
++    private static FileSystemWatcher? _watcher;
++    private static Timer? _pump;
++    private static string? _directory;
++    private static int _armBusy;
++    private static int _started;
++    private static int _frameSeq;
++
++    public static bool IsFrameOpen
++    {
++        [MethodImpl(MethodImplOptions.AggressiveInlining)]
++        get => t_frame != 0;
++    }
++
++    public static void Start(string? directory)
++    {
++        try
++        {
++            if (Interlocked.Exchange(ref _started, 1) == 1)
++                return;
++            if (string.IsNullOrWhiteSpace(directory))
++                return;
++
++            Directory.CreateDirectory(directory);
++            _directory = directory;
++            _session = new FseInputDiagSession(new DiagLimits(), NowMs, OpenStreams, backgroundWriter: true);
++
++            _watcher = new FileSystemWatcher(directory, ArmFileName)
++            {
++                NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
++                IncludeSubdirectories = false,
++                EnableRaisingEvents = true,
++            };
++            _watcher.Created += OnArmSignal;
++            _watcher.Changed += OnArmSignal;
++            _watcher.Renamed += OnArmSignal;
++
++            if (File.Exists(Path.Combine(directory, ArmFileName)))
++                ScheduleRead();
++        }
++        catch
++        {
++            // A failed watcher must not stop controller startup.
++        }
++    }
++
++    public static void Stop()
++    {
++        try
++        {
++            if (_watcher is not null)
++            {
++                _watcher.EnableRaisingEvents = false;
++                _watcher.Created -= OnArmSignal;
++                _watcher.Changed -= OnArmSignal;
++                _watcher.Renamed -= OnArmSignal;
++                _watcher.Dispose();
++                _watcher = null;
++            }
++
++            try
++            {
++                _pump?.Change(Timeout.Infinite, Timeout.Infinite);
++                _pump?.Dispose();
++            }
++            catch
++            {
++                // The pump timer may already be disposed.
++            }
++            _pump = null;
++            _session?.Stop();
++            t_frame = 0;
++            t_bag = null;
++        }
++        catch
++        {
++            // Diagnostic shutdown must not change controller disposal.
++        }
++    }
++
++    public static uint BeginFrame()
++    {
++        try
++        {
++            FseInputDiagSession? session = _session;
++            if (session is not { IsCapturing: true })
++            {
++                t_frame = 0;
++                t_bag = null;
++                return 0;
++            }
++
++            session.Pump();
++            if (!session.IsCapturing)
++            {
++                t_frame = 0;
++                t_bag = null;
++                return 0;
++            }
++
++            uint id = (uint)Interlocked.Increment(ref _frameSeq);
++            t_frame = id;
++            t_bag = new FrameBag
++            {
++                Frame = id,
++                Ms = session.ElapsedMs(),
++            };
++            return id;
++        }
++        catch
++        {
++            t_frame = 0;
++            t_bag = null;
++            return 0;
++        }
++    }
++
++    public static void EndFrame(uint frame)
++    {
++        if (frame == 0)
++            return;
++
++        try
++        {
++            FrameBag? bag = t_bag;
++            t_bag = null;
++            t_frame = 0;
++            if (bag is null || bag.Frame != frame)
++                return;
++
++            FseInputDiagSession? session = _session;
++            if (session is null)
++                return;
++
++            session.TryEnqueue(bag.ToRaw());
++            session.TryEnqueue(bag.ToMap());
++            session.TryEnqueue(bag.ToSend());
++        }
++        catch
++        {
++            t_bag = null;
++            t_frame = 0;
++        }
++    }
++
++    public static void NotePublish(bool publishLive)
++    {
++        try
++        {
++            if (t_bag is { } bag)
++                bag.PublishLive = publishLive;
++        }
++        catch
++        {
++            // Ignore diagnostic failures.
++        }
++    }
++
++    public static void NoteHalt(DiagHalt halt)
++    {
++        try
++        {
++            if (t_bag is { } bag)
++                bag.Halt = halt;
++        }
++        catch
++        {
++            // Ignore diagnostic failures.
++        }
++    }
++
++    public static void NoteRaw(IController controller, DiagReadResult result, int error, DiagSkipReason skip)
++    {
++        try
++        {
++            if (t_bag is not { } bag)
++                return;
++
++            bag.HasRaw = true;
++            bag.ReadResult = result;
++            bag.ErrorCode = error;
++            bag.Skip = skip;
++            bag.Backend = controller is SDLController ? DiagBackend.Sdl : controller is XInputController ? DiagBackend.XInput : DiagBackend.None;
++            bag.Alias = controller switch
++            {
++                OneXPlayerX2Controller => DiagAlias.Oxp,
++                NintendoSwitchProController => DiagAlias.Switch,
++                XInputController => DiagAlias.XInput,
++                SDLController => DiagAlias.Sdl,
++                _ => DiagAlias.None,
++            };
++
++            try
++            {
++                int userIndex = controller.GetUserIndex();
++                bag.UserIndex = (uint)userIndex <= byte.MaxValue ? (byte)userIndex : byte.MaxValue;
++                bag.IsVirtual = controller.IsVirtual();
++                bag.IsDummy = controller.IsDummy();
++                bag.IsXInput = controller.IsXInput();
++                bag.Vid = controller.GetVendorID();
++                bag.Pid = controller.GetProductID();
++                bag.PnpUserIndex = controller.Details?.XInputUserIndex ?? byte.MaxValue;
++                string instanceId = controller.GetInstanceId() ?? string.Empty;
++                bag.InstanceHash = DiagText.Fnv1a32(instanceId);
++                bag.Tail = DiagText.SanitizeTail(instanceId);
++                if (controller is SDLController sdl)
++                    bag.SdlType = (int)sdl.GamepadType;
++                bag.VidPidMatch = bag.IsVirtual && bag.Vid == VirtualManager.VendorId && bag.Pid == VirtualManager.ProductId;
++            }
++            catch
++            {
++                // Identity is best-effort; the read result above still stands.
++            }
++
++            try
++            {
++                ControllerState? inputs = controller.Inputs;
++                if (inputs is not null)
++                {
++                    bag.Buttons = Pack(inputs.ButtonState);
++                    ReadAxes(inputs.AxisState, out bag.Lx, out bag.Ly, out bag.Rx, out bag.Ry, out bag.L2, out bag.R2);
++                }
++            }
++            catch
++            {
++                // Leave axes at zero when the state cannot be read.
++            }
++        }
++        catch
++        {
++            // Never break the controller read.
++        }
++    }
++
++    public static void NoteLayout(ControllerState state)
++    {
++        try
++        {
++            if (t_bag is not { } bag || state is null)
++                return;
++            bag.HasLayout = true;
++            bag.LayoutButtons = Pack(state.ButtonState);
++            ReadAxes(state.AxisState, out bag.LayoutLx, out bag.LayoutLy, out bag.LayoutRx, out bag.LayoutRy, out bag.LayoutL2, out bag.LayoutR2);
++        }
++        catch
++        {
++            // Ignore diagnostic failures.
++        }
++    }
++
++    public static void NoteOutput(ControllerState state, bool mute, bool listening, bool focus, int foregroundPid, string? foregroundExe, int hidStatus, int hidMode, ushort virtualVid, ushort virtualPid, bool virtualConnected)
++    {
++        try
++        {
++            if (t_bag is not { } bag || state is null)
++                return;
++            bag.HasOutput = true;
++            bag.OutButtons = Pack(state.ButtonState);
++            ReadAxes(state.AxisState, out bag.OutLx, out bag.OutLy, out bag.OutRx, out bag.OutRy, out bag.OutL2, out bag.OutR2);
++            bag.Mute = mute;
++            bag.Listening = listening;
++            bag.Focus = focus;
++            bag.ForegroundPid = foregroundPid;
++            bag.ForegroundExe = DiagText.SanitizeExe(foregroundExe);
++            bag.HidStatus = hidStatus;
++            bag.HidMode = hidMode;
++            bag.VirtualVid = virtualVid;
++            bag.VirtualPid = virtualPid;
++            bag.VirtualConnected = virtualConnected;
++        }
++        catch
++        {
++            // Ignore diagnostic failures.
++        }
++    }
++
++    public static void NoteSend(DiagSendDecision decision)
++    {
++        try
++        {
++            if (t_bag is not { } bag || bag.HasSend)
++                return;
++            bag.HasSend = true;
++            bag.Send = decision;
++        }
++        catch
++        {
++            // Ignore diagnostic failures.
++        }
++    }
++
++    private static void OnArmSignal(object sender, FileSystemEventArgs e) => ScheduleRead();
++
++    private static void ScheduleRead()
++    {
++        if (Interlocked.CompareExchange(ref _armBusy, 1, 0) != 0)
++            return;
++
++        ThreadPool.QueueUserWorkItem(_ =>
++        {
++            try
++            {
++                Thread.Sleep(300);
++                if (!TryConsumeArm(out string text) || _session is not { } session || !session.TryArm(text, BaseSha))
++                {
++                    Interlocked.Exchange(ref _armBusy, 0);
++                    return;
++                }
++
++                StartPump();
++                try
++                {
++                    LogManager.LogInformation("FSE input diagnostic armed");
++                }
++                catch
++                {
++                    // Logging is optional.
++                }
++            }
++            catch
++            {
++                Interlocked.Exchange(ref _armBusy, 0);
++            }
++        });
++    }
++
++    private static bool TryConsumeArm(out string text)
++    {
++        text = string.Empty;
++        try
++        {
++            if (string.IsNullOrEmpty(_directory))
++                return false;
++            string path = Path.Combine(_directory, ArmFileName);
++            if (!File.Exists(path))
++                return false;
++
++            byte[] buffer = new byte[64];
++            using (FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
++            {
++                int read = stream.Read(buffer, 0, buffer.Length);
++                text = System.Text.Encoding.ASCII.GetString(buffer, 0, read);
++            }
++
++            try
++            {
++                File.Delete(path);
++            }
++            catch
++            {
++                // A leftover arm file is ignored while this capture is busy.
++            }
++
++            return true;
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    private static void StartPump()
++    {
++        Timer? timer = _pump;
++        if (timer is null)
++        {
++            _pump = new Timer(OnPump, null, 200, 200);
++            return;
++        }
++
++        try
++        {
++            timer.Change(200, 200);
++        }
++        catch
++        {
++            _pump = new Timer(OnPump, null, 200, 200);
++        }
++    }
++
++    private static void OnPump(object? state)
++    {
++        try
++        {
++            FseInputDiagSession? session = _session;
++            if (session is null)
++                return;
++            session.Pump();
++            if (session.State is DiagSessionState.Finished or DiagSessionState.Idle)
++            {
++                Interlocked.Exchange(ref _armBusy, 0);
++                try
++                {
++                    _pump?.Change(Timeout.Infinite, Timeout.Infinite);
++                }
++                catch
++                {
++                    // Ignore a disposed timer.
++                }
++            }
++        }
++        catch
++        {
++            // The pump must not take down the process.
++        }
++    }
++
++    private static DiagStreams OpenStreams()
++    {
++        string directory = _directory ?? ".";
++        FileStream samples = new(Path.Combine(directory, SampleFileName), FileMode.Create, FileAccess.Write, FileShare.Read, 65536, FileOptions.SequentialScan);
++        FileStream summary = new(Path.Combine(directory, SummaryFileName), FileMode.Create, FileAccess.Write, FileShare.Read, 4096, FileOptions.SequentialScan);
++        return new DiagStreams(samples, summary);
++    }
++
++    private static long NowMs()
++    {
++        return Stopwatch.GetTimestamp() * 1000L / Frequency;
++    }
++
++    private static uint Pack(ButtonState buttons)
++    {
++        uint mask = 0;
++        if (buttons[ButtonFlags.DPadUp]) mask |= 1u << DiagText.DUp;
++        if (buttons[ButtonFlags.DPadDown]) mask |= 1u << DiagText.DDown;
++        if (buttons[ButtonFlags.DPadLeft]) mask |= 1u << DiagText.DLeft;
++        if (buttons[ButtonFlags.DPadRight]) mask |= 1u << DiagText.DRight;
++        if (buttons[ButtonFlags.Start]) mask |= 1u << DiagText.Start;
++        if (buttons[ButtonFlags.Back]) mask |= 1u << DiagText.Back;
++        if (buttons[ButtonFlags.LeftStickClick]) mask |= 1u << DiagText.L3;
++        if (buttons[ButtonFlags.RightStickClick]) mask |= 1u << DiagText.R3;
++        if (buttons[ButtonFlags.L1]) mask |= 1u << DiagText.L1;
++        if (buttons[ButtonFlags.R1]) mask |= 1u << DiagText.R1;
++        if (buttons[ButtonFlags.B1]) mask |= 1u << DiagText.B1;
++        if (buttons[ButtonFlags.B2]) mask |= 1u << DiagText.B2;
++        if (buttons[ButtonFlags.B3]) mask |= 1u << DiagText.B3;
++        if (buttons[ButtonFlags.B4]) mask |= 1u << DiagText.B4;
++        if (buttons[ButtonFlags.L2Soft]) mask |= 1u << DiagText.L2Soft;
++        if (buttons[ButtonFlags.R2Soft]) mask |= 1u << DiagText.R2Soft;
++        if (buttons[ButtonFlags.L2Full]) mask |= 1u << DiagText.L2Full;
++        if (buttons[ButtonFlags.R2Full]) mask |= 1u << DiagText.R2Full;
++        if (buttons[ButtonFlags.Special]) mask |= 1u << DiagText.Special;
++        if (buttons[ButtonFlags.L4]) mask |= 1u << DiagText.L4;
++        if (buttons[ButtonFlags.R4]) mask |= 1u << DiagText.R4;
++        return mask;
++    }
++
++    private static void ReadAxes(AxisState axes, out short lx, out short ly, out short rx, out short ry, out short l2, out short r2)
++    {
++        lx = axes[AxisFlags.LeftStickX];
++        ly = axes[AxisFlags.LeftStickY];
++        rx = axes[AxisFlags.RightStickX];
++        ry = axes[AxisFlags.RightStickY];
++        l2 = axes[AxisFlags.L2];
++        r2 = axes[AxisFlags.R2];
++    }
++
++    private sealed class FrameBag
++    {
++        public uint Frame;
++        public long Ms;
++        public bool HasRaw;
++        public DiagReadResult ReadResult;
++        public int ErrorCode;
++        public DiagSkipReason Skip;
++        public DiagBackend Backend;
++        public DiagAlias Alias;
++        public byte UserIndex;
++        public byte PnpUserIndex;
++        public ushort Vid;
++        public ushort Pid;
++        public string? Tail;
++        public uint InstanceHash;
++        public bool IsVirtual;
++        public bool IsDummy;
++        public bool IsXInput;
++        public bool VidPidMatch;
++        public int SdlType;
++        public uint Buttons;
++        public short Lx;
++        public short Ly;
++        public short Rx;
++        public short Ry;
++        public short L2;
++        public short R2;
++        public bool PublishLive;
++        public DiagHalt Halt;
++        public bool HasLayout;
++        public uint LayoutButtons;
++        public short LayoutLx;
++        public short LayoutLy;
++        public short LayoutRx;
++        public short LayoutRy;
++        public short LayoutL2;
++        public short LayoutR2;
++        public bool HasOutput;
++        public uint OutButtons;
++        public short OutLx;
++        public short OutLy;
++        public short OutRx;
++        public short OutRy;
++        public short OutL2;
++        public short OutR2;
++        public bool Mute;
++        public bool Listening;
++        public bool Focus;
++        public int ForegroundPid;
++        public string? ForegroundExe;
++        public int HidStatus;
++        public int HidMode;
++        public ushort VirtualVid;
++        public ushort VirtualPid;
++        public bool VirtualConnected;
++        public bool HasSend;
++        public DiagSendDecision Send;
++
++        public DiagSample ToRaw() => new()
++        {
++            Stage = DiagStage.Raw,
++            Frame = Frame,
++            Ms = Ms,
++            Present = HasRaw,
++            Backend = Backend,
++            Alias = Alias,
++            UserIndex = UserIndex,
++            PnpUserIndex = PnpUserIndex,
++            Vid = Vid,
++            Pid = Pid,
++            Tail = Tail,
++            InstanceHash = InstanceHash,
++            IsVirtual = IsVirtual,
++            IsDummy = IsDummy,
++            IsXInput = IsXInput,
++            VidPidMatch = VidPidMatch,
++            SdlType = SdlType,
++            ReadResult = HasRaw ? ReadResult : DiagReadResult.Missing,
++            ErrorCode = ErrorCode,
++            Skip = Skip,
++            Buttons = Buttons,
++            Lx = Lx,
++            Ly = Ly,
++            Rx = Rx,
++            Ry = Ry,
++            L2 = L2,
++            R2 = R2,
++        };
++
++        public DiagSample ToMap() => new()
++        {
++            Stage = DiagStage.Map,
++            Frame = Frame,
++            Ms = Ms,
++            Present = HasLayout,
++            PublishLive = PublishLive,
++            Halt = Halt,
++            Buttons = LayoutButtons,
++            Lx = LayoutLx,
++            Ly = LayoutLy,
++            Rx = LayoutRx,
++            Ry = LayoutRy,
++            L2 = LayoutL2,
++            R2 = LayoutR2,
++            OutButtons = OutButtons,
++            OutLx = OutLx,
++            OutLy = OutLy,
++            OutRx = OutRx,
++            OutRy = OutRy,
++            OutL2 = OutL2,
++            OutR2 = OutR2,
++            Mute = Mute,
++            Listening = Listening,
++            Focus = Focus,
++            ForegroundPid = ForegroundPid,
++            ForegroundExe = ForegroundExe,
++            HidStatus = HidStatus,
++            HidMode = HidMode,
++            VirtualVid = VirtualVid,
++            VirtualPid = VirtualPid,
++            VirtualConnected = VirtualConnected,
++        };
++
++        public DiagSample ToSend() => new()
++        {
++            Stage = DiagStage.Send,
++            Frame = Frame,
++            Ms = Ms,
++            Send = HasSend ? Send : DiagSendDecision.NotReached,
++        };
++    }
++}
+diff --git a/HandheldCompanion/HandheldCompanion.csproj b/HandheldCompanion/HandheldCompanion.csproj
+index 1e1ba4c0bd5e568a4fe640caa5ba01396cec2496..a0b973326e7ae970f837d5e1048f76e6129e0258 100644
+--- a/HandheldCompanion/HandheldCompanion.csproj
++++ b/HandheldCompanion/HandheldCompanion.csproj
+@@ -272,6 +272,11 @@
+ 		<PackageReference Include="WpfScreenHelper" Version="2.1.1" />
+ 		<PackageReference Include="YamlDotNet" Version="18.1.0" />
+ 	</ItemGroup>
++	<ItemGroup>
++		<Compile Include="..\diagnostics\FseInputDiag\DiagModel.cs" Link="Diagnostics\Portable\DiagModel.cs" />
++		<Compile Include="..\diagnostics\FseInputDiag\DiagText.cs" Link="Diagnostics\Portable\DiagText.cs" />
++		<Compile Include="..\diagnostics\FseInputDiag\FseInputDiagSession.cs" Link="Diagnostics\Portable\FseInputDiagSession.cs" />
++	</ItemGroup>
+ 	<ItemGroup>
+ 		<ProjectReference Include="..\controller-hidapi.net\controller-hidapi.net.csproj" />
+ 		<ProjectReference Include="..\hidapi.net\hidapi.net.csproj" />
+diff --git a/HandheldCompanion/Managers/ControllerManager.cs b/HandheldCompanion/Managers/ControllerManager.cs
+index e477fea59407cd811ec71a460937ffa47a7e735d..0904a3c86fc31cec35dc45fc2e3f28c93f9e2ae5 100644
+--- a/HandheldCompanion/Managers/ControllerManager.cs
++++ b/HandheldCompanion/Managers/ControllerManager.cs
+@@ -1,4 +1,6 @@
++using FseInputDiag;
+ using HandheldCompanion.Controllers;
++using HandheldCompanion.Diagnostics;
+ using HandheldCompanion.Controllers.Dummies;
+ using HandheldCompanion.Controllers.Lenovo;
+ using HandheldCompanion.Controllers.MSI;
+@@ -238,6 +240,12 @@ public static partial class ControllerManager
+         Controllers[string.Empty] = GetDefault();
+         PickTargetController();
+ 
++        try
++        {
++            FseInputDiagHost.Start(App.SettingsPath);
++        }
++        catch { }
++
+         IsInitialized = true;
+         Initialized?.Invoke();
+ 
+@@ -308,6 +316,32 @@ public static partial class ControllerManager
+ 
+ 
+     private static void Tick(long ticks, float delta)
++    {
++        uint diagFrame = 0;
++        try
++        {
++            diagFrame = FseInputDiagHost.BeginFrame();
++        }
++        catch
++        {
++            diagFrame = 0;
++        }
++
++        try
++        {
++            TickCore(ticks, delta);
++        }
++        finally
++        {
++            try
++            {
++                FseInputDiagHost.EndFrame(diagFrame);
++            }
++            catch { }
++        }
++    }
++
++    private static void TickCore(long ticks, float delta)
+     {
+         RemoveTimedOutNetworkControllers();
+ 
+@@ -316,14 +350,25 @@ public static partial class ControllerManager
+             tc = targetController;
+ 
+         if (tc is null)
++        {
++            if (FseInputDiagHost.IsFrameOpen)
++                FseInputDiagHost.NoteHalt(DiagHalt.NoTarget);
+             return;
++        }
+ 
+         tc.Tick(ticks, delta);
+ 
+         // Publish a neutral state while a retained power-cycle target is unavailable.
+-        ControllerState controllerState = tc.IsDummy() || (tc.IsReady && tc.IsConnected()) ? tc.Inputs : mutedState;
++        bool publishLive = tc.IsDummy() || (tc.IsReady && tc.IsConnected());
++        ControllerState controllerState = publishLive ? tc.Inputs : mutedState;
++        if (FseInputDiagHost.IsFrameOpen)
++            FseInputDiagHost.NotePublish(publishLive);
+         if (controllerState is null)
++        {
++            if (FseInputDiagHost.IsFrameOpen)
++                FseInputDiagHost.NoteHalt(DiagHalt.NullState);
+             return;
++        }
+ 
+         // snapshot motions; button-only controllers may not have a motion sensor
+         Dictionary<byte, GamepadMotion> motions = tc.gamepadMotions;
+@@ -357,7 +402,11 @@ public static partial class ControllerManager
+ 
+             // Do not allow a controller to be used remotely if it is already broadcasting to a peer.
+             if (NetworkControllerHelper.IsBroadcasting(tc))
++            {
++                if (FseInputDiagHost.IsFrameOpen)
++                    FseInputDiagHost.NoteHalt(DiagHalt.Broadcast);
+                 return;
++            }
+         }
+ 
+         // raise event, before layout mapping
+@@ -378,6 +427,9 @@ public static partial class ControllerManager
+                 EventHelper.RaiseInputsUpdatedAsync(inputsUpdated, mapped, true);
+         }
+ 
++        if (FseInputDiagHost.IsFrameOpen)
++            FseInputDiagHost.NoteLayout(mapped);
++
+         // controller is muted
+         if (ControllerMuted)
+             mapped = mutedState;
+@@ -390,11 +442,55 @@ public static partial class ControllerManager
+ 
+         DS4Touch.UpdateInputs(mapped);
+         mapped = DS4Touch.ApplyOverlayInputs(mapped);
++        if (FseInputDiagHost.IsFrameOpen)
++            NoteDiagnosticOutput(mapped);
+         VirtualManager.UpdateInputs(mapped, gamepadMotion);
+         DSUServer.UpdateInputs(mapped, motions);
+         DSUServer.Tick(ticks, delta);
+     }
+ 
++    private static void NoteDiagnosticOutput(ControllerState mapped)
++    {
++        try
++        {
++            int pid = 0;
++            string? exe = null;
++            try
++            {
++                ProcessEx? foreground = foregroundProcess;
++                if (foreground is not null)
++                {
++                    pid = foreground.ProcessId;
++                    exe = foreground.Executable;
++                }
++            }
++            catch { }
++
++            bool focus = false;
++            try { focus = UIGamepad.HasFocus(); } catch { }
++
++            bool listening = false;
++            try { listening = InputsManager.IsListening; } catch { }
++
++            bool virtualConnected = false;
++            try { virtualConnected = VirtualManager.vTarget?.IsConnected == true; } catch { }
++
++            FseInputDiagHost.NoteOutput(
++                mapped,
++                ControllerMuted,
++                listening,
++                focus,
++                pid,
++                exe,
++                (int)VirtualManager.HIDstatus,
++                (int)VirtualManager.HIDmode,
++                VirtualManager.VendorId,
++                VirtualManager.ProductId,
++                virtualConnected);
++        }
++        catch { }
++    }
++
+     #region Network controller transport
+ 
+     private static void NetworkTimer_Elapsed(object? sender, ElapsedEventArgs e)
+@@ -483,6 +579,12 @@ public static partial class ControllerManager
+         if (!IsInitialized)
+             return;
+ 
++        try
++        {
++            FseInputDiagHost.Stop();
++        }
++        catch { }
++
+         // kill pump thread
+         if (pumpThread is not null)
+         {
+diff --git a/HandheldCompanion/Managers/VirtualManager.cs b/HandheldCompanion/Managers/VirtualManager.cs
+index 1888f43921060d2a3775d570324894661d865c19..9339aad6068807d526118b611079c4e835bb4dd2 100644
+--- a/HandheldCompanion/Managers/VirtualManager.cs
++++ b/HandheldCompanion/Managers/VirtualManager.cs
+@@ -1,4 +1,6 @@
++using FseInputDiag;
+ using HandheldCompanion.Controllers;
++using HandheldCompanion.Diagnostics;
+ using HandheldCompanion.Inputs;
+ using HandheldCompanion.Notifications;
+ using HandheldCompanion.Shared;
+@@ -683,10 +685,18 @@ namespace HandheldCompanion.Managers
+         {
+             // Skip sending inputs to virtual controller when listening for hotkey inputs
+             if (InputsManager.IsListening)
++            {
++                if (FseInputDiagHost.IsFrameOpen)
++                    FseInputDiagHost.NoteSend(DiagSendDecision.Listening);
+                 return;
++            }
+ 
+             if (isSystemSleeping)
++            {
++                if (FseInputDiagHost.IsFrameOpen)
++                    FseInputDiagHost.NoteSend(DiagSendDecision.Sleep);
+                 return;
++            }
+ 
+             // Deduplicate: skip if controller state hasn't changed meaningfully
+             if (prevControllerState is not null)
+@@ -696,9 +706,16 @@ namespace HandheldCompanion.Managers
+                 bool gyroChanged = GyroStateHasSignificantChange(prevControllerState.GyroState, controllerState.GyroState);
+ 
+                 if (!buttonChanged && !axisChanged && !gyroChanged)
++                {
++                    if (FseInputDiagHost.IsFrameOpen)
++                        FseInputDiagHost.NoteSend(DiagSendDecision.Unchanged);
+                     return; // No significant change, skip update
++                }
+             }
+ 
++            if (vTarget is null && FseInputDiagHost.IsFrameOpen)
++                FseInputDiagHost.NoteSend(DiagSendDecision.NullTarget);
++
+             vTarget?.UpdateInputs(controllerState, gamepadMotion);
+ 
+             // Cache the current state for next tick
+diff --git a/HandheldCompanion/Targets/VTarget.cs b/HandheldCompanion/Targets/VTarget.cs
+index 2d28f16502718a8b5c8ba4f10bd247e53087e311..a0d3c72bb4c225df687ce1198d2cc65549a50011 100644
+--- a/HandheldCompanion/Targets/VTarget.cs
++++ b/HandheldCompanion/Targets/VTarget.cs
+@@ -1,4 +1,6 @@
++using FseInputDiag;
+ using HandheldCompanion.Controllers;
++using HandheldCompanion.Diagnostics;
+ using HandheldCompanion.Shared;
+ using HandheldCompanion.Utils;
+ using System;
+@@ -90,7 +92,11 @@ namespace HandheldCompanion.Targets
+         public virtual void UpdateInputs(ControllerState inputs, GamepadMotion gamepadMotion)
+         {
+             if (!IsConnected)
++            {
++                if (FseInputDiagHost.IsFrameOpen)
++                    FseInputDiagHost.NoteSend(DiagSendDecision.Disconnected);
+                 return;
++            }
+ 
+             try
+             {
+@@ -98,8 +104,18 @@ namespace HandheldCompanion.Targets
+             }
+             catch (Exception ex)
+             {
++                try
++                {
++                    if (FseInputDiagHost.IsFrameOpen)
++                        FseInputDiagHost.NoteSend(DiagSendDecision.SendError);
++                }
++                catch { }
+                 LogManager.LogError(ex.Message);
++                return;
+             }
++
++            if (FseInputDiagHost.IsFrameOpen)
++                FseInputDiagHost.NoteSend(DiagSendDecision.Sent);
+         }
+ 
+         protected virtual byte[] BuildReport(ControllerState inputs, GamepadMotion gamepadMotion)
+diff --git a/diagnostics/FseInputDiag.Tests/FseInputDiag.Tests.csproj b/diagnostics/FseInputDiag.Tests/FseInputDiag.Tests.csproj
+new file mode 100644
+index 0000000000000000000000000000000000000000..044d895f6b01ec23d6d75221ae9ac7045b247174
+--- /dev/null
++++ b/diagnostics/FseInputDiag.Tests/FseInputDiag.Tests.csproj
+@@ -0,0 +1,16 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <TargetFramework>net8.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++    <IsPackable>false</IsPackable>
++  </PropertyGroup>
++  <ItemGroup>
++    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
++    <PackageReference Include="xunit" Version="2.9.2" />
++    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
++  </ItemGroup>
++  <ItemGroup>
++    <ProjectReference Include="..\FseInputDiag\FseInputDiag.csproj" />
++  </ItemGroup>
++</Project>
+diff --git a/diagnostics/FseInputDiag.Tests/SessionTests.cs b/diagnostics/FseInputDiag.Tests/SessionTests.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d82bbbd905463e1d43dacca770f060987bfb0e54
+--- /dev/null
++++ b/diagnostics/FseInputDiag.Tests/SessionTests.cs
+@@ -0,0 +1,346 @@
++using System.Text;
++using System.Text.Json;
++using FseInputDiag;
++using Xunit;
++
++namespace FseInputDiag.Tests;
++
++public class SessionTests
++{
++    private const string Sha = "0a0a13b937ed987a131a0729226a03de374e7d91";
++
++    [Fact]
++    public void DisabledEnqueueIsNoop()
++    {
++        using var harness = Harness.Create();
++        Assert.False(harness.Session.IsCapturing);
++        Assert.False(harness.Session.TryEnqueue(Send(1, DiagSendDecision.Sent)));
++        harness.Session.Pump();
++        harness.Session.Flush();
++
++        Assert.Equal(0, harness.Session.QueueDrops);
++        Assert.Equal(0, harness.Session.SampleDrops);
++        Assert.Equal(0, harness.Session.ByteDrops);
++        Assert.Equal(0, harness.Session.WrittenSamples);
++        Assert.Equal(0, harness.Samples.Length);
++    }
++
++    [Fact]
++    public void DurationIsHardCappedAtThirtySeconds()
++    {
++        long now = 5_000;
++        using var harness = Harness.Create(nowProvider: () => now, limits: new DiagLimits { MaxDurationMs = 120_000 });
++        Assert.Equal(DiagLimits.HardMaxDurationMs, harness.Session.EffectiveDurationMs);
++        Assert.True(harness.Session.TryArm("", Sha));
++        now = harness.Session.ArmDeadlineMs;
++        harness.Session.Pump();
++
++        Assert.True(harness.Session.IsCapturing);
++        Assert.Equal(now + DiagLimits.HardMaxDurationMs, harness.Session.CaptureDeadlineMs);
++        long deadline = harness.Session.CaptureDeadlineMs;
++        Assert.False(harness.Session.TryArm("20", Sha));
++        Assert.Equal(deadline, harness.Session.CaptureDeadlineMs);
++
++        now = deadline - 1;
++        Assert.True(harness.Session.TryEnqueue(Send(1, DiagSendDecision.Sent)));
++        now = deadline;
++        Assert.False(harness.Session.TryEnqueue(Send(999, DiagSendDecision.Sent)));
++        harness.Session.Pump();
++        Assert.False(harness.Session.IsCapturing);
++        Assert.Equal(0, harness.Session.QueueDrops);
++
++        now = deadline + 60_000;
++        Assert.False(harness.Session.TryEnqueue(Send(1000, DiagSendDecision.Sent)));
++        harness.Session.Flush();
++
++        string text = harness.ReadSamples();
++        Assert.Contains("\"f\":1", text);
++        Assert.DoesNotContain("\"f\":999", text);
++        Assert.DoesNotContain("\"f\":1000", text);
++        Assert.Contains("\"reason\":\"duration\"", text);
++        Assert.Contains("\"elapsedMs\":30000", text);
++    }
++
++    [Fact]
++    public void NewArmAfterFinishDoesNotExtendThePreviousWindow()
++    {
++        long now = 0;
++        using var harness = Harness.Create(nowProvider: () => now);
++        Assert.True(harness.Session.TryArm("3", Sha));
++        now = harness.Session.ArmDeadlineMs;
++        harness.Session.Pump();
++        long firstDeadline = harness.Session.CaptureDeadlineMs;
++        now = firstDeadline;
++        harness.Session.Pump();
++        harness.Session.Flush();
++
++        Assert.True(harness.Session.TryArm("", Sha));
++        Assert.Equal(0, harness.Session.CaptureDeadlineMs);
++        now = harness.Session.ArmDeadlineMs;
++        harness.Session.Pump();
++        Assert.Equal(now + DiagLimits.HardMaxDurationMs, harness.Session.CaptureDeadlineMs);
++        Assert.NotEqual(firstDeadline + DiagLimits.HardMaxDurationMs, harness.Session.CaptureDeadlineMs);
++    }
++
++    [Fact]
++    public void QueueOverflowCountsDrops()
++    {
++        long now = 0;
++        using var harness = Harness.Create(nowProvider: () => now, limits: new DiagLimits { MaxQueue = 2 });
++        Start(harness, ref now);
++        Assert.True(harness.Session.TryEnqueue(Send(1, DiagSendDecision.Sent)));
++        Assert.True(harness.Session.TryEnqueue(Send(2, DiagSendDecision.Sent)));
++        Assert.False(harness.Session.TryEnqueue(Send(3, DiagSendDecision.Sent)));
++        Assert.False(harness.Session.TryEnqueue(Send(4, DiagSendDecision.Sent)));
++        Assert.Equal(2, harness.Session.QueueDrops);
++        harness.Finish(ref now);
++        Assert.Equal(2, harness.Session.WrittenSamples);
++    }
++
++    [Fact]
++    public void SampleCapCountsDrops()
++    {
++        long now = 0;
++        using var harness = Harness.Create(nowProvider: () => now, limits: new DiagLimits { MaxSamples = 2, MaxQueue = 8 });
++        Start(harness, ref now);
++        Assert.True(harness.Session.TryEnqueue(Send(1, DiagSendDecision.Unchanged)));
++        Assert.True(harness.Session.TryEnqueue(Send(2, DiagSendDecision.Unchanged)));
++        Assert.False(harness.Session.TryEnqueue(Send(3, DiagSendDecision.Unchanged)));
++        Assert.Equal(1, harness.Session.SampleDrops);
++        harness.Finish(ref now);
++        Assert.Equal(2, harness.Session.WrittenSamples);
++        Assert.True(harness.Session.WrittenBytes <= harness.Session.EffectiveMaxBytes);
++    }
++
++    [Fact]
++    public void OutputByteCapStopsWriting()
++    {
++        long now = 0;
++        using var harness = Harness.Create(nowProvider: () => now, limits: new DiagLimits { MaxOutputBytes = 220, MaxQueue = 16, MaxSamples = 16 });
++        Start(harness, ref now);
++        for (uint frame = 1; frame <= 8; frame++)
++            harness.Session.TryEnqueue(Send(frame, DiagSendDecision.Sent));
++        harness.Finish(ref now);
++
++        Assert.True(harness.Session.ByteDrops > 0);
++        Assert.True(harness.Session.WrittenSamples < 8);
++        Assert.True(harness.Session.WrittenBytes <= 220);
++    }
++
++    [Fact]
++    public void CorrelatesRawMappedAndSendIncludingMutedListeningUnchangedAndMissing()
++    {
++        long now = 0;
++        using var harness = Harness.Create(nowProvider: () => now);
++        Start(harness, ref now);
++
++        EnqueueFrame(harness, raw: Raw(1, DiagReadResult.Missing, present: false), map: Map(1, mute: true, listen: false, buttons: 0, outButtons: 0), send: DiagSendDecision.Unchanged);
++        EnqueueFrame(harness, raw: Raw(2, DiagReadResult.Ok, present: true, buttons: 1u << DiagText.B1, lx: 1200), map: Map(2, mute: false, listen: true, buttons: 1u << DiagText.B1, outButtons: 1u << DiagText.B1), send: DiagSendDecision.Listening);
++        EnqueueFrame(harness, raw: Raw(3, DiagReadResult.Ok, present: true, buttons: 1u << DiagText.B2), map: Map(3, mute: true, listen: false, buttons: 1u << DiagText.B2, outButtons: 0), send: DiagSendDecision.Sent);
++        EnqueueFrame(harness, raw: Raw(4, DiagReadResult.Skipped, present: true), map: Map(4, mute: false, listen: false, buttons: 0, outButtons: 0, present: false), send: DiagSendDecision.NotReached);
++
++        harness.Finish(ref now);
++        var rows = harness.ReadObjects().Where(row => row.GetProperty("kind").GetString() is "raw" or "map" or "send").ToList();
++
++        AssertTriplet(rows, 1, "missing", mute: true, listen: false, decision: "unchanged", rawBtn: "", mapBtn: "");
++        AssertTriplet(rows, 2, "ok", mute: false, listen: true, decision: "listening", rawBtn: "B1", mapBtn: "B1");
++        AssertTriplet(rows, 3, "ok", mute: true, listen: false, decision: "sent", rawBtn: "B2", mapBtn: "B2");
++        JsonElement map3 = rows.Single(row => row.GetProperty("kind").GetString() == "map" && row.GetProperty("f").GetUInt32() == 3);
++        Assert.Equal("", map3.GetProperty("outBtn").GetString());
++        AssertTriplet(rows, 4, "skipped", mute: false, listen: false, decision: "not_reached", rawBtn: "", mapBtn: "");
++        JsonElement map4 = rows.Single(row => row.GetProperty("kind").GetString() == "map" && row.GetProperty("f").GetUInt32() == 4);
++        Assert.False(map4.GetProperty("present").GetBoolean());
++    }
++
++    [Fact]
++    public void FormatterDropsPathsUsernamesAndUnsafeText()
++    {
++        string line = DiagText.FormatSample(new DiagSample
++        {
++            Stage = DiagStage.Raw,
++            Frame = 7,
++            Present = true,
++            ReadResult = DiagReadResult.Ok,
++            Tail = @"C:\Users\tim\USB\VID_045E&PID_028E\0123456789",
++            Backend = DiagBackend.XInput,
++            Alias = DiagAlias.Oxp,
++        });
++        string map = DiagText.FormatSample(new DiagSample
++        {
++            Stage = DiagStage.Map,
++            Frame = 7,
++            Present = true,
++            ForegroundExe = @"C:\Users\tim\steam.exe",
++        });
++
++        Assert.Contains("\"tail\":\"0123456789\"", line);
++        Assert.DoesNotContain("Users", line);
++        Assert.DoesNotContain("tim", line);
++        Assert.Contains("\"fg\":\"steam.exe\"", map);
++        Assert.DoesNotContain("Users", map);
++        Assert.DoesNotContain("tim", map);
++        Assert.Equal("0123456789", DiagText.SanitizeTail(@"USB\VID_045E&PID_028E\0123456789"));
++        Assert.Equal("296013F", DiagText.SanitizeTail(@"USB\VID_045E&PID_028E\296013F"));
++        Assert.Equal(4062603164u, DiagText.Fnv1a32("0123456789"));
++    }
++
++    [Theory]
++    [InlineData("", 12_000)]
++    [InlineData("delay=8", 8_000)]
++    [InlineData("1", 3_000)]
++    [InlineData("100", 20_000)]
++    [InlineData("not-a-delay", 12_000)]
++    public void DelayIsClamped(string text, int expectedMs)
++    {
++        Assert.Equal(expectedMs, DiagText.ParseDelayMs(text, new DiagLimits()));
++    }
++
++    [Fact]
++    public void ClockFailureDoesNotEscape()
++    {
++        var session = new FseInputDiagSession(new DiagLimits(), () => throw new InvalidOperationException("clock"), () => new DiagStreams(new MemoryStream(), new MemoryStream()), false);
++        session.Pump();
++        Assert.False(session.TryEnqueue(Send(1, DiagSendDecision.Sent)));
++        session.Stop();
++    }
++
++    [Fact]
++    public async Task BackgroundWriterDrainsOffTheCaller()
++    {
++        long now = 0;
++        var samples = new MemoryStream();
++        var summary = new MemoryStream();
++        var session = new FseInputDiagSession(new DiagLimits(), () => now, () => new DiagStreams(samples, summary), backgroundWriter: true);
++        Assert.True(session.TryArm("", Sha));
++        now = session.ArmDeadlineMs;
++        session.Pump();
++        Assert.True(session.TryEnqueue(Send(4, DiagSendDecision.Disconnected)));
++        now = session.CaptureDeadlineMs;
++        session.Pump();
++        session.Stop();
++
++        string text = Encoding.UTF8.GetString(samples.ToArray());
++        string summaryText = Encoding.UTF8.GetString(summary.ToArray());
++        Assert.Contains("\"decision\":\"disconnected\"", text);
++        Assert.Contains("\"reason\":\"duration\"", text);
++        Assert.Contains("base=" + Sha, summaryText);
++        Assert.DoesNotContain("Users", text);
++        await Task.CompletedTask;
++    }
++
++    private static void Start(Harness harness, ref long now)
++    {
++        Assert.True(harness.Session.TryArm("", Sha));
++        now = harness.Session.ArmDeadlineMs;
++        harness.Session.Pump();
++        Assert.True(harness.Session.IsCapturing);
++    }
++
++    private static void EnqueueFrame(Harness harness, DiagSample raw, DiagSample map, DiagSendDecision send)
++    {
++        Assert.True(harness.Session.TryEnqueue(raw));
++        Assert.True(harness.Session.TryEnqueue(map));
++        Assert.True(harness.Session.TryEnqueue(Send(raw.Frame, send)));
++    }
++
++    private static void AssertTriplet(List<JsonElement> rows, uint frame, string read, bool mute, bool listen, string decision, string rawBtn, string mapBtn)
++    {
++        JsonElement raw = rows.Single(row => row.GetProperty("kind").GetString() == "raw" && row.GetProperty("f").GetUInt32() == frame);
++        JsonElement map = rows.Single(row => row.GetProperty("kind").GetString() == "map" && row.GetProperty("f").GetUInt32() == frame);
++        JsonElement send = rows.Single(row => row.GetProperty("kind").GetString() == "send" && row.GetProperty("f").GetUInt32() == frame);
++        Assert.Equal(read, raw.GetProperty("res").GetString());
++        Assert.Equal(rawBtn, raw.GetProperty("btn").GetString());
++        Assert.Equal(mapBtn, map.GetProperty("btn").GetString());
++        Assert.Equal(mute, map.GetProperty("mute").GetBoolean());
++        Assert.Equal(listen, map.GetProperty("listen").GetBoolean());
++        Assert.Equal(decision, send.GetProperty("decision").GetString());
++        Assert.Equal(raw.GetProperty("ms").GetInt64(), map.GetProperty("ms").GetInt64());
++        Assert.Equal(raw.GetProperty("ms").GetInt64(), send.GetProperty("ms").GetInt64());
++    }
++
++    private static DiagSample Send(uint frame, DiagSendDecision decision) => new()
++    {
++        Stage = DiagStage.Send,
++        Frame = frame,
++        Ms = 10,
++        Send = decision,
++    };
++
++    private static DiagSample Raw(uint frame, DiagReadResult result, bool present, uint buttons = 0, short lx = 0) => new()
++    {
++        Stage = DiagStage.Raw,
++        Frame = frame,
++        Ms = 10,
++        Present = present,
++        ReadResult = result,
++        Backend = DiagBackend.XInput,
++        Alias = DiagAlias.Oxp,
++        Buttons = buttons,
++        Lx = lx,
++        Tail = "0123456789",
++    };
++
++    private static DiagSample Map(uint frame, bool mute, bool listen, uint buttons, uint outButtons, bool present = true) => new()
++    {
++        Stage = DiagStage.Map,
++        Frame = frame,
++        Ms = 10,
++        Present = present,
++        PublishLive = present,
++        Buttons = buttons,
++        OutButtons = outButtons,
++        Mute = mute,
++        Listening = listen,
++        Focus = mute,
++        ForegroundPid = 12160,
++        ForegroundExe = "steam.exe",
++    };
++
++    private sealed class Harness : IDisposable
++    {
++        private readonly MemoryStream _samples;
++        private readonly MemoryStream _summary;
++        private Harness(FseInputDiagSession session, MemoryStream samples, MemoryStream summary)
++        {
++            Session = session;
++            _samples = samples;
++            _summary = summary;
++        }
++
++        public FseInputDiagSession Session { get; }
++        public MemoryStream Samples => _samples;
++
++        public static Harness Create(Func<long>? nowProvider = null, DiagLimits? limits = null)
++        {
++            long now = 0;
++            nowProvider ??= () => now;
++            var samples = new MemoryStream();
++            var summary = new MemoryStream();
++            var session = new FseInputDiagSession(limits, nowProvider, () => new DiagStreams(samples, summary), backgroundWriter: false);
++            return new Harness(session, samples, summary);
++        }
++
++        public void Finish(ref long now)
++        {
++            now = Session.CaptureDeadlineMs;
++            Session.Pump();
++            Session.Flush();
++        }
++
++        public string ReadSamples()
++        {
++            Session.Flush();
++            return Encoding.UTF8.GetString(_samples.ToArray());
++        }
++
++        public List<JsonElement> ReadObjects()
++        {
++            return ReadSamples()
++                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
++                .Select(line => JsonDocument.Parse(line).RootElement.Clone())
++                .ToList();
++        }
++
++        public void Dispose() => Session.Stop();
++    }
++}
+diff --git a/diagnostics/FseInputDiag/DiagModel.cs b/diagnostics/FseInputDiag/DiagModel.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..76cee5e66b478de0c653c1fc186f7117414f71a9
+--- /dev/null
++++ b/diagnostics/FseInputDiag/DiagModel.cs
+@@ -0,0 +1,162 @@
++using System;
++using System.IO;
++
++namespace FseInputDiag;
++
++public enum DiagStage : byte
++{
++    Raw = 1,
++    Map = 2,
++    Send = 3,
++}
++
++public enum DiagBackend : byte
++{
++    None = 0,
++    XInput = 1,
++    Sdl = 2,
++}
++
++public enum DiagAlias : byte
++{
++    None = 0,
++    Oxp = 1,
++    Switch = 2,
++    XInput = 3,
++    Sdl = 4,
++}
++
++public enum DiagReadResult : byte
++{
++    Missing = 0,
++    Ok = 1,
++    Failed = 2,
++    NullController = 3,
++    Skipped = 4,
++}
++
++public enum DiagSkipReason : byte
++{
++    None = 0,
++    InputsNull = 1,
++    Busy = 2,
++    NotPlugged = 3,
++    Disposing = 4,
++    NotConnected = 5,
++}
++
++public enum DiagSendDecision : byte
++{
++    NotReached = 0,
++    Listening = 1,
++    Sleep = 2,
++    Unchanged = 3,
++    NullTarget = 4,
++    Disconnected = 5,
++    Sent = 6,
++    SendError = 7,
++}
++
++public enum DiagHalt : byte
++{
++    None = 0,
++    NoTarget = 1,
++    NullState = 2,
++    Broadcast = 3,
++}
++
++public enum DiagSessionState : byte
++{
++    Idle = 0,
++    Armed = 1,
++    Capturing = 2,
++    Finished = 3,
++}
++
++public sealed class DiagLimits
++{
++    public const int HardMaxDurationMs = 30_000;
++    public const int HardMaxQueue = 512;
++    public const int HardMaxSamples = 12_000;
++    public const int HardMaxOutputBytes = 3_145_728;
++    public const int HardMinDelayMs = 3_000;
++    public const int HardMaxDelayMs = 20_000;
++    public const int HardDefaultDelayMs = 12_000;
++
++    public int MaxDurationMs { get; init; } = HardMaxDurationMs;
++    public int MaxQueue { get; init; } = HardMaxQueue;
++    public int MaxSamples { get; init; } = HardMaxSamples;
++    public int MaxOutputBytes { get; init; } = HardMaxOutputBytes;
++    public int MinDelayMs { get; init; } = HardMinDelayMs;
++    public int MaxDelayMs { get; init; } = HardMaxDelayMs;
++    public int DefaultDelayMs { get; init; } = HardDefaultDelayMs;
++}
++
++public sealed class DiagSample
++{
++    public DiagStage Stage { get; init; }
++    public uint Frame { get; init; }
++    public long Ms { get; init; }
++    public bool Present { get; init; }
++    public DiagBackend Backend { get; init; }
++    public DiagAlias Alias { get; init; }
++    public byte UserIndex { get; init; }
++    public byte PnpUserIndex { get; init; }
++    public ushort Vid { get; init; }
++    public ushort Pid { get; init; }
++    public string? Tail { get; init; }
++    public uint InstanceHash { get; init; }
++    public bool IsVirtual { get; init; }
++    public bool IsDummy { get; init; }
++    public bool IsXInput { get; init; }
++    public bool VidPidMatch { get; init; }
++    public int SdlType { get; init; }
++    public DiagReadResult ReadResult { get; init; }
++    public int ErrorCode { get; init; }
++    public DiagSkipReason Skip { get; init; }
++    public uint Buttons { get; init; }
++    public short Lx { get; init; }
++    public short Ly { get; init; }
++    public short Rx { get; init; }
++    public short Ry { get; init; }
++    public short L2 { get; init; }
++    public short R2 { get; init; }
++    public bool PublishLive { get; init; }
++    public uint OutButtons { get; init; }
++    public short OutLx { get; init; }
++    public short OutLy { get; init; }
++    public short OutRx { get; init; }
++    public short OutRy { get; init; }
++    public short OutL2 { get; init; }
++    public short OutR2 { get; init; }
++    public bool Mute { get; init; }
++    public bool Listening { get; init; }
++    public bool Focus { get; init; }
++    public int ForegroundPid { get; init; }
++    public string? ForegroundExe { get; init; }
++    public int HidStatus { get; init; }
++    public int HidMode { get; init; }
++    public ushort VirtualVid { get; init; }
++    public ushort VirtualPid { get; init; }
++    public bool VirtualConnected { get; init; }
++    public DiagHalt Halt { get; init; }
++    public DiagSendDecision Send { get; init; }
++}
++
++public sealed class DiagStreams : IDisposable
++{
++    public DiagStreams(Stream samples, Stream summary)
++    {
++        Samples = samples;
++        Summary = summary;
++    }
++
++    public Stream Samples { get; }
++    public Stream Summary { get; }
++
++    public void Dispose()
++    {
++        Samples.Dispose();
++        Summary.Dispose();
++    }
++}
+diff --git a/diagnostics/FseInputDiag/DiagText.cs b/diagnostics/FseInputDiag/DiagText.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..45c85be8f1adadf56c33170d53caa15c4483f24d
+--- /dev/null
++++ b/diagnostics/FseInputDiag/DiagText.cs
+@@ -0,0 +1,285 @@
++using System;
++using System.Globalization;
++using System.Text;
++
++namespace FseInputDiag;
++
++public static class DiagText
++{
++    public const int DUp = 0;
++    public const int DDown = 1;
++    public const int DLeft = 2;
++    public const int DRight = 3;
++    public const int Start = 4;
++    public const int Back = 5;
++    public const int L3 = 6;
++    public const int R3 = 7;
++    public const int L1 = 8;
++    public const int R1 = 9;
++    public const int B1 = 10;
++    public const int B2 = 11;
++    public const int B3 = 12;
++    public const int B4 = 13;
++    public const int L2Soft = 14;
++    public const int R2Soft = 15;
++    public const int L2Full = 16;
++    public const int R2Full = 17;
++    public const int Special = 18;
++    public const int L4 = 19;
++    public const int R4 = 20;
++
++    private static readonly string[] ButtonNames =
++    [
++        "DUp", "DDown", "DLeft", "DRight", "Start", "Back", "L3", "R3",
++        "L1", "R1", "B1", "B2", "B3", "B4", "L2Soft", "R2Soft", "L2Full", "R2Full",
++        "Special", "L4", "R4",
++    ];
++
++    public static uint Fnv1a32(string? text)
++    {
++        uint hash = 2166136261;
++        if (string.IsNullOrEmpty(text))
++            return hash;
++
++        foreach (char ch in text)
++        {
++            hash ^= (byte)ch;
++            hash *= 16777619;
++            hash ^= (byte)(ch >> 8);
++            hash *= 16777619;
++        }
++
++        return hash;
++    }
++
++    public static string? SanitizeTail(string? value)
++    {
++        string? segment = LastSegment(value);
++        return Keep(segment, 16, allowPunctuation: false);
++    }
++
++    public static string? SanitizeExe(string? value)
++    {
++        string? segment = LastSegment(value);
++        return Keep(segment, 32, allowPunctuation: true);
++    }
++
++    public static int ParseDelayMs(string? text, DiagLimits limits)
++    {
++        int min = Math.Clamp(limits.MinDelayMs, DiagLimits.HardMinDelayMs, DiagLimits.HardMaxDelayMs);
++        int max = Math.Clamp(limits.MaxDelayMs, min, DiagLimits.HardMaxDelayMs);
++        int fallback = Math.Clamp(limits.DefaultDelayMs, min, max);
++        if (string.IsNullOrWhiteSpace(text))
++            return fallback;
++
++        int start = -1;
++        int end = -1;
++        for (int i = 0; i < text.Length && i < 64; i++)
++        {
++            if (text[i] is >= '0' and <= '9')
++            {
++                if (start < 0)
++                    start = i;
++                end = i;
++            }
++            else if (start >= 0)
++            {
++                break;
++            }
++        }
++
++        if (start < 0 || !int.TryParse(text.AsSpan(start, end - start + 1), NumberStyles.None, CultureInfo.InvariantCulture, out int seconds))
++            return fallback;
++
++        long ms = (long)seconds * 1000L;
++        if (ms < min)
++            return min;
++        if (ms > max)
++            return max;
++        return (int)ms;
++    }
++
++    public static string FormatSample(DiagSample sample)
++    {
++        var sb = new StringBuilder(256);
++        sb.Append("{\"kind\":\"");
++        sb.Append(sample.Stage switch
++        {
++            DiagStage.Raw => "raw",
++            DiagStage.Map => "map",
++            _ => "send",
++        });
++        sb.Append("\",\"f\":").Append(sample.Frame);
++        sb.Append(",\"ms\":").Append(sample.Ms);
++
++        switch (sample.Stage)
++        {
++            case DiagStage.Raw:
++                sb.Append(",\"present\":").Append(sample.Present ? "true" : "false");
++                sb.Append(",\"be\":\"").Append(Backend(sample.Backend)).Append('"');
++                sb.Append(",\"alias\":\"").Append(Alias(sample.Alias)).Append('"');
++                sb.Append(",\"ui\":").Append(sample.UserIndex);
++                sb.Append(",\"pnpUi\":").Append(sample.PnpUserIndex);
++                sb.Append(",\"vid\":").Append(sample.Vid);
++                sb.Append(",\"pid\":").Append(sample.Pid);
++                sb.Append(",\"tail\":").Append(JsonToken(SanitizeTail(sample.Tail)));
++                sb.Append(",\"inst\":").Append(sample.InstanceHash);
++                sb.Append(",\"virt\":").Append(sample.IsVirtual ? "true" : "false");
++                sb.Append(",\"dummy\":").Append(sample.IsDummy ? "true" : "false");
++                sb.Append(",\"xinput\":").Append(sample.IsXInput ? "true" : "false");
++                sb.Append(",\"vidPidMatch\":").Append(sample.VidPidMatch ? "true" : "false");
++                sb.Append(",\"sdlType\":").Append(sample.SdlType);
++                sb.Append(",\"res\":\"").Append(Read(sample.ReadResult)).Append('"');
++                sb.Append(",\"err\":").Append(sample.ErrorCode);
++                sb.Append(",\"skip\":\"").Append(Skip(sample.Skip)).Append('"');
++                AppendAxes(sb, sample.Buttons, sample.Lx, sample.Ly, sample.Rx, sample.Ry, sample.L2, sample.R2, output: false);
++                break;
++            case DiagStage.Map:
++                sb.Append(",\"present\":").Append(sample.Present ? "true" : "false");
++                sb.Append(",\"publishLive\":").Append(sample.PublishLive ? "true" : "false");
++                sb.Append(",\"halt\":\"").Append(Halt(sample.Halt)).Append('"');
++                AppendAxes(sb, sample.Buttons, sample.Lx, sample.Ly, sample.Rx, sample.Ry, sample.L2, sample.R2, output: false);
++                sb.Append(",\"outBtn\":\"").Append(FormatButtons(sample.OutButtons)).Append('"');
++                sb.Append(",\"outLx\":").Append(sample.OutLx);
++                sb.Append(",\"outLy\":").Append(sample.OutLy);
++                sb.Append(",\"outRx\":").Append(sample.OutRx);
++                sb.Append(",\"outRy\":").Append(sample.OutRy);
++                sb.Append(",\"outL2\":").Append(sample.OutL2);
++                sb.Append(",\"outR2\":").Append(sample.OutR2);
++                sb.Append(",\"mute\":").Append(sample.Mute ? "true" : "false");
++                sb.Append(",\"listen\":").Append(sample.Listening ? "true" : "false");
++                sb.Append(",\"focus\":").Append(sample.Focus ? "true" : "false");
++                sb.Append(",\"fgPid\":").Append(sample.ForegroundPid);
++                sb.Append(",\"fg\":").Append(JsonToken(SanitizeExe(sample.ForegroundExe)));
++                sb.Append(",\"hid\":").Append(sample.HidStatus);
++                sb.Append(",\"mode\":").Append(sample.HidMode);
++                sb.Append(",\"vVid\":").Append(sample.VirtualVid);
++                sb.Append(",\"vPid\":").Append(sample.VirtualPid);
++                sb.Append(",\"vConn\":").Append(sample.VirtualConnected ? "true" : "false");
++                break;
++            default:
++                sb.Append(",\"decision\":\"").Append(Decision(sample.Send)).Append('"');
++                break;
++        }
++
++        sb.Append('}');
++        return sb.ToString();
++    }
++
++    public static string FormatButtons(uint mask)
++    {
++        var sb = new StringBuilder();
++        for (int i = 0; i < ButtonNames.Length; i++)
++        {
++            if ((mask & (1u << i)) == 0)
++                continue;
++            if (sb.Length > 0)
++                sb.Append('+');
++            sb.Append(ButtonNames[i]);
++        }
++
++        return sb.ToString();
++    }
++
++    private static void AppendAxes(StringBuilder sb, uint buttons, short lx, short ly, short rx, short ry, short l2, short r2, bool output)
++    {
++        _ = output;
++        sb.Append(",\"btn\":\"").Append(FormatButtons(buttons)).Append('"');
++        sb.Append(",\"lx\":").Append(lx);
++        sb.Append(",\"ly\":").Append(ly);
++        sb.Append(",\"rx\":").Append(rx);
++        sb.Append(",\"ry\":").Append(ry);
++        sb.Append(",\"l2\":").Append(l2);
++        sb.Append(",\"r2\":").Append(r2);
++    }
++
++    private static string JsonToken(string? sanitized)
++    {
++        return sanitized is null ? "null" : "\"" + sanitized + "\"";
++    }
++
++    private static string? LastSegment(string? value)
++    {
++        if (string.IsNullOrWhiteSpace(value))
++            return null;
++
++        int cut = value.LastIndexOfAny(['\\', '/']);
++        return cut >= 0 ? value[(cut + 1)..] : value;
++    }
++
++    private static string? Keep(string? value, int max, bool allowPunctuation)
++    {
++        if (string.IsNullOrEmpty(value))
++            return null;
++
++        var sb = new StringBuilder(Math.Min(value.Length, max));
++        foreach (char c in value)
++        {
++            bool ok = c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9';
++            if (!ok && allowPunctuation)
++                ok = c is '.' or '_' or '-';
++            if (!ok)
++                continue;
++            sb.Append(c);
++            if (sb.Length == max)
++                break;
++        }
++
++        return sb.Length == 0 ? null : sb.ToString();
++    }
++
++    private static string Backend(DiagBackend backend) => backend switch
++    {
++        DiagBackend.XInput => "xinput",
++        DiagBackend.Sdl => "sdl",
++        _ => "none",
++    };
++
++    private static string Alias(DiagAlias alias) => alias switch
++    {
++        DiagAlias.Oxp => "oxp",
++        DiagAlias.Switch => "switch",
++        DiagAlias.XInput => "xinput",
++        DiagAlias.Sdl => "sdl",
++        _ => "none",
++    };
++
++    private static string Read(DiagReadResult result) => result switch
++    {
++        DiagReadResult.Ok => "ok",
++        DiagReadResult.Failed => "failed",
++        DiagReadResult.NullController => "null",
++        DiagReadResult.Skipped => "skipped",
++        _ => "missing",
++    };
++
++    private static string Skip(DiagSkipReason reason) => reason switch
++    {
++        DiagSkipReason.InputsNull => "inputs",
++        DiagSkipReason.Busy => "busy",
++        DiagSkipReason.NotPlugged => "unplugged",
++        DiagSkipReason.Disposing => "disposing",
++        DiagSkipReason.NotConnected => "disconnected",
++        _ => "none",
++    };
++
++    private static string Halt(DiagHalt halt) => halt switch
++    {
++        DiagHalt.NoTarget => "no_target",
++        DiagHalt.NullState => "null_state",
++        DiagHalt.Broadcast => "broadcast",
++        _ => "none",
++    };
++
++    public static string Decision(DiagSendDecision decision) => decision switch
++    {
++        DiagSendDecision.Listening => "listening",
++        DiagSendDecision.Sleep => "sleep",
++        DiagSendDecision.Unchanged => "unchanged",
++        DiagSendDecision.NullTarget => "null_target",
++        DiagSendDecision.Disconnected => "disconnected",
++        DiagSendDecision.Sent => "sent",
++        DiagSendDecision.SendError => "send_error",
++        _ => "not_reached",
++    };
++}
+diff --git a/diagnostics/FseInputDiag/FseInputDiag.csproj b/diagnostics/FseInputDiag/FseInputDiag.csproj
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d3a7d5dea0df3b1c5ef062281edce21988bf031
+--- /dev/null
++++ b/diagnostics/FseInputDiag/FseInputDiag.csproj
+@@ -0,0 +1,10 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <TargetFramework>net8.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++    <RootNamespace>FseInputDiag</RootNamespace>
++    <AssemblyName>FseInputDiag</AssemblyName>
++    <LangVersion>latest</LangVersion>
++  </PropertyGroup>
++</Project>
+diff --git a/diagnostics/FseInputDiag/FseInputDiagSession.cs b/diagnostics/FseInputDiag/FseInputDiagSession.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d44b34a4945334013bc2c5c05e22be463dd6ef27
+--- /dev/null
++++ b/diagnostics/FseInputDiag/FseInputDiagSession.cs
+@@ -0,0 +1,448 @@
++using System;
++using System.Collections.Concurrent;
++using System.Globalization;
++using System.IO;
++using System.Text;
++using System.Threading;
++
++namespace FseInputDiag;
++
++public sealed class FseInputDiagSession
++{
++    private readonly DiagLimits _limits;
++    private readonly Func<long> _nowMs;
++    private readonly Func<DiagStreams> _open;
++    private readonly bool _backgroundWriter;
++    private readonly int _durationMs;
++    private readonly int _maxSamples;
++    private readonly int _maxBytes;
++    private readonly int _maxQueue;
++    private readonly object _sync = new();
++
++    private BlockingCollection<DiagSample> _queue;
++    private DiagStreams? _output;
++    private StreamWriter? _samples;
++    private StreamWriter? _summary;
++    private Thread? _writer;
++    private int _state = (int)DiagSessionState.Idle;
++    private long _armDeadline;
++    private long _captureStart;
++    private long _captureDeadline;
++    private long _elapsedAtFinish;
++    private string _reason = "idle";
++    private int _accepted;
++    private int _written;
++    private int _writtenBytes;
++    private int _queueDrops;
++    private int _sampleDrops;
++    private int _byteDrops;
++    private int _bytesExhausted;
++    private int _headerWritten;
++    private int _footerWritten;
++    private string _baseSha = "";
++
++    public FseInputDiagSession(DiagLimits? limits, Func<long> nowMs, Func<DiagStreams> open, bool backgroundWriter)
++    {
++        _limits = limits ?? new DiagLimits();
++        _nowMs = nowMs ?? throw new ArgumentNullException(nameof(nowMs));
++        _open = open ?? throw new ArgumentNullException(nameof(open));
++        _backgroundWriter = backgroundWriter;
++        _durationMs = Math.Clamp(_limits.MaxDurationMs, 1, DiagLimits.HardMaxDurationMs);
++        _maxSamples = Math.Clamp(_limits.MaxSamples, 1, DiagLimits.HardMaxSamples);
++        _maxBytes = Math.Clamp(_limits.MaxOutputBytes, 1, DiagLimits.HardMaxOutputBytes);
++        _maxQueue = Math.Clamp(_limits.MaxQueue, 1, DiagLimits.HardMaxQueue);
++        _queue = new BlockingCollection<DiagSample>(_maxQueue);
++    }
++
++    public DiagSessionState State => (DiagSessionState)Volatile.Read(ref _state);
++    public bool IsCapturing => State == DiagSessionState.Capturing;
++    public int EffectiveDurationMs => _durationMs;
++    public int EffectiveMaxSamples => _maxSamples;
++    public int EffectiveMaxBytes => _maxBytes;
++    public int EffectiveMaxQueue => _maxQueue;
++    public long CaptureDeadlineMs => Volatile.Read(ref _captureDeadline);
++    public long ArmDeadlineMs => Volatile.Read(ref _armDeadline);
++
++    public long ElapsedMs()
++    {
++        long start = Volatile.Read(ref _captureStart);
++        if (start == 0)
++            return 0;
++        return Math.Max(0, SafeNow() - start);
++    }
++    public int QueueDrops => Volatile.Read(ref _queueDrops);
++    public int SampleDrops => Volatile.Read(ref _sampleDrops);
++    public int ByteDrops => Volatile.Read(ref _byteDrops);
++    public int WrittenSamples => Volatile.Read(ref _written);
++    public int WrittenBytes => Volatile.Read(ref _writtenBytes);
++    public string BaseSha => _baseSha;
++
++    public bool TryArm(string? armText, string baseSha)
++    {
++        try
++        {
++            int delay = DiagText.ParseDelayMs(armText, _limits);
++            lock (_sync)
++            {
++                if (State is DiagSessionState.Armed or DiagSessionState.Capturing)
++                    return false;
++                if (_writer is { IsAlive: true })
++                    return false;
++
++                ResetUnlocked();
++                _baseSha = baseSha ?? "";
++                Volatile.Write(ref _armDeadline, SafeNow() + delay);
++                Volatile.Write(ref _state, (int)DiagSessionState.Armed);
++                return true;
++            }
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    public void Pump()
++    {
++        try
++        {
++            var state = State;
++            long now = SafeNow();
++            if (state == DiagSessionState.Armed)
++            {
++                lock (_sync)
++                {
++                    if (State == DiagSessionState.Armed && now >= _armDeadline)
++                        EnterCaptureUnlocked(now);
++                }
++            }
++            else if (state == DiagSessionState.Capturing && now >= Volatile.Read(ref _captureDeadline))
++            {
++                Finish("duration");
++            }
++        }
++        catch
++        {
++            // Diagnostic timing must not escape into the caller.
++        }
++    }
++
++    public bool TryEnqueue(DiagSample sample)
++    {
++        try
++        {
++            if (Volatile.Read(ref _state) != (int)DiagSessionState.Capturing)
++                return false;
++
++            long now = SafeNow();
++            if (now >= Volatile.Read(ref _captureDeadline))
++            {
++                Finish("duration");
++                return false;
++            }
++
++            if (Volatile.Read(ref _bytesExhausted) == 1)
++            {
++                Interlocked.Increment(ref _byteDrops);
++                return false;
++            }
++
++            if (Volatile.Read(ref _accepted) >= _maxSamples)
++            {
++                Interlocked.Increment(ref _sampleDrops);
++                return false;
++            }
++
++            if (!_queue.TryAdd(sample))
++            {
++                Interlocked.Increment(ref _queueDrops);
++                return false;
++            }
++
++            Interlocked.Increment(ref _accepted);
++            return true;
++        }
++        catch
++        {
++            return false;
++        }
++    }
++
++    public void Flush()
++    {
++        try
++        {
++            if (_backgroundWriter)
++                return;
++            WriteAvailable();
++            if (State == DiagSessionState.Finished)
++                WriteFooterOnce();
++        }
++        catch
++        {
++            Volatile.Write(ref _bytesExhausted, 1);
++        }
++    }
++
++    public void Stop()
++    {
++        try
++        {
++            lock (_sync)
++            {
++                if (State == DiagSessionState.Armed)
++                {
++                    Volatile.Write(ref _state, (int)DiagSessionState.Idle);
++                    _reason = "cancelled";
++                    CompleteQueue();
++                    return;
++                }
++            }
++
++            if (State == DiagSessionState.Capturing)
++                Finish("stop");
++
++            if (!_backgroundWriter)
++                Flush();
++            else
++                _writer?.Join(TimeSpan.FromMilliseconds(500));
++        }
++        catch
++        {
++            // Disposal of the diagnostic session must not break controller shutdown.
++        }
++    }
++
++    private void EnterCaptureUnlocked(long now)
++    {
++        Volatile.Write(ref _captureStart, now);
++        Volatile.Write(ref _captureDeadline, now + _durationMs);
++        _reason = "duration";
++        Volatile.Write(ref _state, (int)DiagSessionState.Capturing);
++        if (_backgroundWriter)
++        {
++            _writer = new Thread(WriterLoop)
++            {
++                IsBackground = true,
++                Name = "fse-input-diag",
++            };
++            _writer.Start();
++        }
++    }
++
++    private void WriterLoop()
++    {
++        try
++        {
++            foreach (DiagSample sample in _queue.GetConsumingEnumerable())
++                WriteSample(sample);
++            WriteFooterOnce();
++        }
++        catch
++        {
++            Volatile.Write(ref _bytesExhausted, 1);
++            try
++            {
++                while (_queue.TryTake(out _))
++                    Interlocked.Increment(ref _byteDrops);
++            }
++            catch
++            {
++                // Ignore a queue that was already completed.
++            }
++        }
++    }
++
++    private void Finish(string reason)
++    {
++        long elapsed = Math.Max(0, SafeNow() - Volatile.Read(ref _captureStart));
++        if (Interlocked.CompareExchange(ref _state, (int)DiagSessionState.Finished, (int)DiagSessionState.Capturing) != (int)DiagSessionState.Capturing)
++            return;
++
++        _reason = reason;
++        Volatile.Write(ref _elapsedAtFinish, elapsed);
++        CompleteQueue();
++    }
++
++    private void WriteAvailable()
++    {
++        while (_queue.TryTake(out DiagSample? sample))
++            WriteSample(sample);
++    }
++
++    private void WriteSample(DiagSample sample)
++    {
++        EnsureWriters();
++        if (_samples is null || Volatile.Read(ref _bytesExhausted) == 1)
++        {
++            Interlocked.Increment(ref _byteDrops);
++            return;
++        }
++
++        string line = DiagText.FormatSample(sample);
++        int bytes = Encoding.UTF8.GetByteCount(line) + 1;
++        if (Volatile.Read(ref _writtenBytes) > _maxBytes - bytes)
++        {
++            Volatile.Write(ref _bytesExhausted, 1);
++            Interlocked.Increment(ref _byteDrops);
++            return;
++        }
++
++        _samples.WriteLine(line);
++        Interlocked.Add(ref _writtenBytes, bytes);
++        Interlocked.Increment(ref _written);
++    }
++
++    private void EnsureWriters()
++    {
++        if (_samples is not null)
++            return;
++
++        _output = _open();
++        _samples = new StreamWriter(_output.Samples, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 16 * 1024, leaveOpen: true)
++        {
++            AutoFlush = false,
++            NewLine = "\n",
++        };
++        _summary = new StreamWriter(_output.Summary, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), 1024, leaveOpen: true)
++        {
++            AutoFlush = false,
++            NewLine = "\n",
++        };
++        WriteHeader();
++    }
++
++    private void WriteHeader()
++    {
++        if (Interlocked.Exchange(ref _headerWritten, 1) == 1 || _samples is null)
++            return;
++
++        string line =
++            "{\"kind\":\"header\",\"v\":1,\"base\":\"" + SafeSha(_baseSha) +
++            "\",\"maxMs\":" + _durationMs.ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"maxSamples\":" + _maxSamples.ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"maxBytes\":" + _maxBytes.ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"maxQueue\":" + _maxQueue.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
++        int bytes = Encoding.UTF8.GetByteCount(line) + 1;
++        if (bytes > _maxBytes)
++        {
++            Volatile.Write(ref _bytesExhausted, 1);
++            Interlocked.Increment(ref _byteDrops);
++            return;
++        }
++
++        _samples.WriteLine(line);
++        Interlocked.Add(ref _writtenBytes, bytes);
++    }
++
++    private void WriteFooterOnce()
++    {
++        if (Interlocked.Exchange(ref _footerWritten, 1) == 1)
++            return;
++
++        EnsureWriters();
++        if (_samples is null)
++            return;
++
++        long elapsed = Volatile.Read(ref _elapsedAtFinish);
++        if (elapsed == 0 && _captureStart != 0)
++            elapsed = Math.Max(0, SafeNow() - _captureStart);
++
++        string reason = string.IsNullOrEmpty(_reason) ? "stop" : _reason;
++        string line =
++            "{\"kind\":\"footer\",\"reason\":\"" + reason +
++            "\",\"written\":" + Volatile.Read(ref _written).ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"bytes\":" + Volatile.Read(ref _writtenBytes).ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"queueDrops\":" + Volatile.Read(ref _queueDrops).ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"sampleDrops\":" + Volatile.Read(ref _sampleDrops).ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"byteDrops\":" + Volatile.Read(ref _byteDrops).ToString(System.Globalization.CultureInfo.InvariantCulture) +
++            ",\"elapsedMs\":" + elapsed.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
++
++        int bytes = Encoding.UTF8.GetByteCount(line) + 1;
++        if (Volatile.Read(ref _writtenBytes) <= _maxBytes - bytes)
++        {
++            _samples.WriteLine(line);
++            Interlocked.Add(ref _writtenBytes, bytes);
++        }
++        else
++        {
++            Interlocked.Increment(ref _byteDrops);
++        }
++
++        _samples.Flush();
++        if (_summary is not null)
++        {
++            _summary.WriteLine("base=" + SafeSha(_baseSha));
++            _summary.WriteLine("reason=" + reason);
++            _summary.WriteLine("written=" + Volatile.Read(ref _written).ToString(System.Globalization.CultureInfo.InvariantCulture));
++            _summary.WriteLine("bytes=" + Volatile.Read(ref _writtenBytes).ToString(System.Globalization.CultureInfo.InvariantCulture));
++            _summary.WriteLine("queueDrops=" + Volatile.Read(ref _queueDrops).ToString(System.Globalization.CultureInfo.InvariantCulture));
++            _summary.WriteLine("sampleDrops=" + Volatile.Read(ref _sampleDrops).ToString(System.Globalization.CultureInfo.InvariantCulture));
++            _summary.WriteLine("byteDrops=" + Volatile.Read(ref _byteDrops).ToString(System.Globalization.CultureInfo.InvariantCulture));
++            _summary.WriteLine("elapsedMs=" + elapsed.ToString(System.Globalization.CultureInfo.InvariantCulture));
++            _summary.Flush();
++        }
++    }
++
++    private void ResetUnlocked()
++    {
++        CompleteQueue();
++        _queue = new BlockingCollection<DiagSample>(_maxQueue);
++        _output = null;
++        _samples = null;
++        _summary = null;
++        _writer = null;
++        Volatile.Write(ref _armDeadline, 0);
++        Volatile.Write(ref _captureStart, 0);
++        Volatile.Write(ref _captureDeadline, 0);
++        _elapsedAtFinish = 0;
++        _reason = "idle";
++        Volatile.Write(ref _accepted, 0);
++        Volatile.Write(ref _written, 0);
++        Volatile.Write(ref _writtenBytes, 0);
++        Volatile.Write(ref _queueDrops, 0);
++        Volatile.Write(ref _sampleDrops, 0);
++        Volatile.Write(ref _byteDrops, 0);
++        Volatile.Write(ref _bytesExhausted, 0);
++        Volatile.Write(ref _headerWritten, 0);
++        Volatile.Write(ref _footerWritten, 0);
++    }
++
++    private void CompleteQueue()
++    {
++        try
++        {
++            _queue.CompleteAdding();
++        }
++        catch
++        {
++            // Already completed.
++        }
++    }
++
++    private long SafeNow()
++    {
++        try
++        {
++            return _nowMs();
++        }
++        catch
++        {
++            return 0;
++        }
++    }
++
++    private static string SafeSha(string sha)
++    {
++        var sb = new StringBuilder(sha.Length);
++        foreach (char c in sha)
++        {
++            if (c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F')
++                sb.Append(c);
++            if (sb.Length == 64)
++                break;
++        }
++
++        return sb.ToString();
++    }
++}
+diff --git a/diagnostics/README.ru.md b/diagnostics/README.ru.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..abf528e342add2942da4983c60802a8ed043b3d9
+--- /dev/null
++++ b/diagnostics/README.ru.md
+@@ -0,0 +1,87 @@
++# Диагностический след ввода FSE для HandheldCompanion 1.4.0.2
++
++Только наблюдение. Патч не меняет драйвер, HidHide, фокус, эмуляцию, раскладку и решение «отправить или нет». Пока захват не включён, на каждом тике остаётся проверка «кадр не открыт» и один наблюдатель файла. Запись на диск идёт в фоне и только во время захвата.
++
++Официальная база: публичный тег `1.4.0.2` репозитория `Valkirie/HandheldCompanion`, коммит `0a0a13b937ed987a131a0729226a03de374e7d91` (релиз «1.4.0.2 - Motion controls, profiles & ONEXPLAYER 3», 2026-11-07). Версия в `.csproj` не менялась. Ветка форка `main` не инструментировалась.
++
++Исполняемый файл не запускался. Проверки внутри FSE и на Windows не было.
++
++На Linux фактически выполнено:
++
++- `dotnet test diagnostics/FseInputDiag.Tests/FseInputDiag.Tests.csproj` (SDK 8.0.428): 15 тестов, 0 ошибок.
++- Кросс-компиляция `dotnet build HandheldCompanion.sln -c Debug -p:Platform=x64 -p:EnableWindowsTargeting=true` (SDK 10.0.404) дошла до 0 ошибок только после локальной подстановки reference assemblies .NET Framework 4.8 и временного обхода cmd-событий PreBuild/PostBuild. Эти обходы в патч не входят. Без них Linux останавливается на `NETSDK1100`, на cmd-скрипте PreBuild и на отсутствии сборок net48.
++
++## Сборка
++
++На Windows, из корня дерева на этом коммите:
++
++```
++dotnet build HandheldCompanion.sln -c Release
++```
++
++Исходники журнала подключены к приложению напрямую, отдельная библиотека для сборки HC не нужна. Переносимые тесты, если установлен .NET 8:
++
++```
++dotnet test diagnostics/FseInputDiag.Tests/FseInputDiag.Tests.csproj
++```
++
++Готовый `HandheldCompanion.exe` заменяет обычный запуск. Этот патч сам ничего не устанавливает и не перезапускает приложение.
++
++## Включение
++
++Захват выключен, пока нет файла
++
++`%LocalAppData%\HandheldCompanion\fse-input-diag.arm`
++
++Файл можно создать в Проводнике. Первая строка — необязательная задержка в секундах, например `12`. Пустой файл означает 12 секунд. Допустимо 3–20; иные числа обрезаются до этого диапазона. Текст файла в журнал не копируется.
++
++После появления файла приложение ждёт эту задержку и только потом пишет 30 секунд. За это время можно вернуться в FSE. Окон, тостов и глобальных горячих клавиш нет. Повторное создание файла во время ожидания или захвата не продлевает окно. Смена источника тоже не продлевает. Новый захват возможен только после завершения предыдущего.
++
++Результат, каждый раз с нуля:
++
++- `%LocalAppData%\HandheldCompanion\fse-input-diag.jsonl`
++- `%LocalAppData%\HandheldCompanion\fse-input-diag.summary.txt`
++
++Полный путь содержит имя пользователя, поэтому в сами файлы он не пишется.
++
++## Формат
++
++JSONL, UTF-8. У каждого кадра один `f` и одно `ms` от монотонного старта захвата.
++
++- `raw` — источник после уже существующего чтения бэкенда: `be` (`xinput` или `sdl`), `alias` (`oxp`, `switch`, `xinput`, `sdl`), `ui` (индекс, которым читали), `pnpUi` (индекс PnP), `vid`, `pid`, `tail` (последний кусок instance id, только буквы и цифры), `inst` (FNV-1a 32 по UTF-16), `virt`, `dummy`, `xinput`, `vidPidMatch` (виртуальный и VID/PID совпали с текущей виртуальной целью), `sdlType`, `res`, `err` (HRESULT, без текста), `skip`, кнопки и оси.
++- `map` — состояние после раскладки (`btn`, оси) и то, что реально ушло в виртуальный вызов (`outBtn`, `out*`). Флаги: `publishLive`, `halt` (`none`, `no_target`, `null_state`, `broadcast`), `mute`, `listen`, `focus` (фокус UI HC), `fgPid`, `fg` (только имя exe), `hid`, `mode`, `vVid`, `vPid`, `vConn`.
++- `send` — решение: `not_reached`, `listening`, `sleep`, `unchanged`, `null_target`, `disconnected`, `sent`, `send_error`.
++
++`res=ok` значит, что существующее чтение вернуло состояние. Кнопки при другом `res` новому чтению не соответствуют. Нулевые оси при `res=ok` — это успешное чтение нулей, а не пропущенный вызов.
++
++Пределы, их нельзя поднять файлом: 30000 мс, 12000 записей, 3145728 байт, очередь 512. Лишнее считается в `queueDrops`, `sampleDrops`, `byteDrops` и в summary. Хвост файла может оборваться на границе кадра.
++
++## Как читать оба бэкенда
++
++OXP идёт как `be=xinput`, `alias=oxp`. Switch Pro USB идёт как `be=sdl`, `alias=switch`. Сравнивать строки с одним `f`.
++
++- `raw.res` = `skipped`, `failed`, `null` или `missing`: до раскладки чтение не состоялось. `skip=disconnected` — SDL не видит устройство; `unplugged` — контроллер не выбран целью; `err` — код исключения XInput.
++- `raw.res=ok`, кнопки/оси нулевые, а физически они нажаты: чтение прошло, но значения пустые. Смотреть `ui`, `pnpUi`, `virt`, `tail`, `inst`, `vidPidMatch`. Физический OXP и виртуальный Xbox 360 имеют один VID/PID `1118/654`; их различают `virt` и `tail` (`0123456789` и `296013F`). Совпадение `virt=true` и `vidPidMatch=true` показывает, что выбранный источник — виртуальное устройство. Это факт идентичности, не вывод о причине.
++- `raw` ненулевой, `map.btn` пустой: значения сняты после чтения и потеряны на раскладке.
++- `map.btn` ненулевой, `mute=true`, `outBtn` пустой: после раскладки сработал mute фокуса UI HC. `focus` — отдельный флаг того же фокуса.
++- `listen=true` и `send=listening`: виртуальная отправка не вызывалась из-за прослушивания хоткея.
++- `send=unchanged`: гейт «без значимого изменения».
++- `send=disconnected` или `null_target`: цель не приняла отправку. `send=sent` значит, что существующий `UpdateInputs` дошёл до `SendInput`. `send_error` — исключение внутри уже существующего catch.
++- `publishLive=false`: в конвейер отдан нейтральный кадр, потому что цель не dummy и не готова/не подключена, даже если `raw` успел прочитаться.
++- `halt=broadcast` / `no_target` / `null_state`: до раскладки и отправки кадр вышел по уже существующей ветке.
++
++Одинаковые поля пишутся для XInput и SDL. Отдельного внешнего XInput-зонда патч не добавляет и все четыре индекса сам не опрашивает.
++
++## Приватность
++
++Файл локальный, сеть не используется. Нет заголовков окон, имён пользователей, клавиатуры, вводимого текста и секретов. Есть PID и имя exe переднего плана, кнопки и оси геймпада, VID/PID, короткий хвост instance id и его хеш.
++
++## Откат
++
++Вернуться на официальный коммит и пересобрать:
++
++```
++git checkout 0a0a13b937ed987a131a0729226a03de374e7d91
++```
++
++Либо снять патч с этого дерева: `git apply -R fse-input-diag-1.4.0.2.patch`. Удалить `fse-input-diag.arm`, `fse-input-diag.jsonl` и `fse-input-diag.summary.txt`. Драйвер и HidHide патч не трогает; обычный выход и запуск HC по-прежнему выполняют их собственный цикл, его этот патч не меняет.
