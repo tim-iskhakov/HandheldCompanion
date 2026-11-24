@@ -27,6 +27,20 @@ dotnet test diagnostics/FseInputDiag.Tests/FseInputDiag.Tests.csproj
 
 Готовый `HandheldCompanion.exe` заменяет обычный запуск. Этот патч сам ничего не устанавливает и не перезапускает приложение.
 
+Обычный Release по-прежнему берёт `HandheldCompanion/RELEASE.manifest`: `requireAdministrator` и `uiAccess="true"`. Это не менялось.
+
+Отдельный диагностический манифест `diagnostics/DIAGNOSTIC.no-uiaccess.manifest` включается только явно:
+
+```
+dotnet build HandheldCompanion.sln -c Release -p:DiagnosticNoUiAccess=true
+```
+
+В нём остаётся `requireAdministrator`, а `uiAccess="false"`. Это обычное приложение с запросом UAC, без привилегии UIAccess и без обхода проверок Windows. Без свойства `-p:DiagnosticNoUiAccess=true` этот манифест не используется. Подпись, политики, сертификаты и установленная копия этой настройкой не меняются.
+
+Такой пакет не равен штатному HC. Совпадение phenotype не доказывает первопричину штатной сборки: у неё другой флаг UIAccess. Отличие относится только к режиму no-uiaccess. Уровень integrity FSE не измерялся, совместимость с FSE по IL не заявляется. Windows и FSE этим деревом не запускались.
+
+Критерий будущего эксперимента, если пакет вообще стартует: сначала тот же phenotype. OXP через HC есть вне FSE и нет в FSE. Switch через тот же virtual output есть в FSE.
+
 ## Включение
 
 Захват выключен, пока нет файла

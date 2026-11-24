@@ -35,6 +35,9 @@
 		<TieredCompilationQuickJit>true</TieredCompilationQuickJit>
 		<TieredCompilationQuickJitForLoops>true</TieredCompilationQuickJitForLoops>
 	</PropertyGroup>
+	<PropertyGroup Condition="'$(Configuration)' == 'Release' AND '$(DiagnosticNoUiAccess)' == 'true'">
+		<ApplicationManifest>..\diagnostics\DIAGNOSTIC.no-uiaccess.manifest</ApplicationManifest>
+	</PropertyGroup>
 	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
 		<DebugType>full</DebugType>
 		<Optimize>false</Optimize>
