@@ -35,6 +35,9 @@
 		<TieredCompilationQuickJit>true</TieredCompilationQuickJit>
 		<TieredCompilationQuickJitForLoops>true</TieredCompilationQuickJitForLoops>
 	</PropertyGroup>
+	<PropertyGroup Condition="'$(Configuration)' == 'Release' AND '$(DiagnosticNoUiAccess)' == 'true'">
+		<ApplicationManifest>..\diagnostics\DIAGNOSTIC.no-uiaccess.manifest</ApplicationManifest>
+	</PropertyGroup>
 	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
 		<DebugType>full</DebugType>
 		<Optimize>false</Optimize>
@@ -271,6 +274,11 @@
 		<PackageReference Include="WindowsInput" Version="6.4.1" />
 		<PackageReference Include="WpfScreenHelper" Version="2.1.1" />
 		<PackageReference Include="YamlDotNet" Version="18.1.0" />
+	</ItemGroup>
+	<ItemGroup>
+		<Compile Include="..\diagnostics\FseInputDiag\DiagModel.cs" Link="Diagnostics\Portable\DiagModel.cs" />
+		<Compile Include="..\diagnostics\FseInputDiag\DiagText.cs" Link="Diagnostics\Portable\DiagText.cs" />
+		<Compile Include="..\diagnostics\FseInputDiag\FseInputDiagSession.cs" Link="Diagnostics\Portable\FseInputDiagSession.cs" />
 	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\controller-hidapi.net\controller-hidapi.net.csproj" />

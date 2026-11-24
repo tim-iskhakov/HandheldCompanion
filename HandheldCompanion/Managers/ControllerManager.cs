@@ -1,4 +1,6 @@
+using FseInputDiag;
 using HandheldCompanion.Controllers;
+using HandheldCompanion.Diagnostics;
 using HandheldCompanion.Controllers.Dummies;
 using HandheldCompanion.Controllers.Lenovo;
 using HandheldCompanion.Controllers.MSI;
@@ -238,6 +240,12 @@ public static partial class ControllerManager
         Controllers[string.Empty] = GetDefault();
         PickTargetController();
 
+        try
+        {
+            FseInputDiagHost.Start(App.SettingsPath);
+        }
+        catch { }
+
         IsInitialized = true;
         Initialized?.Invoke();
 
@@ -309,6 +317,32 @@ public static partial class ControllerManager
 
     private static void Tick(long ticks, float delta)
     {
+        uint diagFrame = 0;
+        try
+        {
+            diagFrame = FseInputDiagHost.BeginFrame();
+        }
+        catch
+        {
+            diagFrame = 0;
+        }
+
+        try
+        {
+            TickCore(ticks, delta);
+        }
+        finally
+        {
+            try
+            {
+                FseInputDiagHost.EndFrame(diagFrame);
+            }
+            catch { }
+        }
+    }
+
+    private static void TickCore(long ticks, float delta)
+    {
         RemoveTimedOutNetworkControllers();
 
         IController? tc;
@@ -316,14 +350,25 @@ public static partial class ControllerManager
             tc = targetController;
 
         if (tc is null)
+        {
+            if (FseInputDiagHost.IsFrameOpen)
+                FseInputDiagHost.NoteHalt(DiagHalt.NoTarget);
             return;
+        }
 
         tc.Tick(ticks, delta);
 
         // Publish a neutral state while a retained power-cycle target is unavailable.
-        ControllerState controllerState = tc.IsDummy() || (tc.IsReady && tc.IsConnected()) ? tc.Inputs : mutedState;
+        bool publishLive = tc.IsDummy() || (tc.IsReady && tc.IsConnected());
+        ControllerState controllerState = publishLive ? tc.Inputs : mutedState;
+        if (FseInputDiagHost.IsFrameOpen)
+            FseInputDiagHost.NotePublish(publishLive);
         if (controllerState is null)
+        {
+            if (FseInputDiagHost.IsFrameOpen)
+                FseInputDiagHost.NoteHalt(DiagHalt.NullState);
             return;
+        }
 
         // snapshot motions; button-only controllers may not have a motion sensor
         Dictionary<byte, GamepadMotion> motions = tc.gamepadMotions;
@@ -357,7 +402,11 @@ public static partial class ControllerManager
 
             // Do not allow a controller to be used remotely if it is already broadcasting to a peer.
             if (NetworkControllerHelper.IsBroadcasting(tc))
+            {
+                if (FseInputDiagHost.IsFrameOpen)
+                    FseInputDiagHost.NoteHalt(DiagHalt.Broadcast);
                 return;
+            }
         }
 
         // raise event, before layout mapping
@@ -378,6 +427,9 @@ public static partial class ControllerManager
                 EventHelper.RaiseInputsUpdatedAsync(inputsUpdated, mapped, true);
         }
 
+        if (FseInputDiagHost.IsFrameOpen)
+            FseInputDiagHost.NoteLayout(mapped);
+
         // controller is muted
         if (ControllerMuted)
             mapped = mutedState;
@@ -390,9 +442,53 @@ public static partial class ControllerManager
 
         DS4Touch.UpdateInputs(mapped);
         mapped = DS4Touch.ApplyOverlayInputs(mapped);
+        if (FseInputDiagHost.IsFrameOpen)
+            NoteDiagnosticOutput(mapped);
         VirtualManager.UpdateInputs(mapped, gamepadMotion);
         DSUServer.UpdateInputs(mapped, motions);
         DSUServer.Tick(ticks, delta);
+    }
+
+    private static void NoteDiagnosticOutput(ControllerState mapped)
+    {
+        try
+        {
+            int pid = 0;
+            string? exe = null;
+            try
+            {
+                ProcessEx? foreground = foregroundProcess;
+                if (foreground is not null)
+                {
+                    pid = foreground.ProcessId;
+                    exe = foreground.Executable;
+                }
+            }
+            catch { }
+
+            bool focus = false;
+            try { focus = UIGamepad.HasFocus(); } catch { }
+
+            bool listening = false;
+            try { listening = InputsManager.IsListening; } catch { }
+
+            bool virtualConnected = false;
+            try { virtualConnected = VirtualManager.vTarget?.IsConnected == true; } catch { }
+
+            FseInputDiagHost.NoteOutput(
+                mapped,
+                ControllerMuted,
+                listening,
+                focus,
+                pid,
+                exe,
+                (int)VirtualManager.HIDstatus,
+                (int)VirtualManager.HIDmode,
+                VirtualManager.VendorId,
+                VirtualManager.ProductId,
+                virtualConnected);
+        }
+        catch { }
     }
 
     #region Network controller transport
@@ -482,6 +578,12 @@ public static partial class ControllerManager
     {
         if (!IsInitialized)
             return;
+
+        try
+        {
+            FseInputDiagHost.Stop();
+        }
+        catch { }
 
         // kill pump thread
         if (pumpThread is not null)

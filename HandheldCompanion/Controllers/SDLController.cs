@@ -1,3 +1,5 @@
+using FseInputDiag;
+using HandheldCompanion.Diagnostics;
 using HandheldCompanion.Inputs;
 using HandheldCompanion.Utils;
 using System;
@@ -264,8 +266,21 @@ namespace HandheldCompanion.Controllers
 
         public override void Tick(long ticks, float delta, bool commit)
         {
-            if (!IsConnected() || Inputs is null || IsBusy || !IsPlugged || _disposing || _disposed)
+            bool connected = IsConnected();
+            if (!connected || Inputs is null || IsBusy || !IsPlugged || _disposing || _disposed)
+            {
+                if (FseInputDiagHost.IsFrameOpen)
+                {
+                    DiagSkipReason reason = !connected
+                        ? DiagSkipReason.NotConnected
+                        : Inputs is null ? DiagSkipReason.InputsNull
+                        : IsBusy ? DiagSkipReason.Busy
+                        : !IsPlugged ? DiagSkipReason.NotPlugged
+                        : DiagSkipReason.Disposing;
+                    FseInputDiagHost.NoteRaw(this, DiagReadResult.Skipped, 0, reason);
+                }
                 return;
+            }
 
             ButtonState.Overwrite(InjectedButtons, Inputs.ButtonState);
 
@@ -408,6 +423,8 @@ namespace HandheldCompanion.Controllers
                 gamepadMotion.ProcessMotion(gX, gY, gZ, aX, aY, aZ, delta);
 
             base.Tick(ticks, delta);
+            if (FseInputDiagHost.IsFrameOpen)
+                FseInputDiagHost.NoteRaw(this, DiagReadResult.Ok, 0, DiagSkipReason.None);
         }
 
         public override string GetGlyph(ButtonFlags button)

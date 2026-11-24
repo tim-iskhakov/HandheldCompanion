@@ -1,3 +1,5 @@
+using FseInputDiag;
+using HandheldCompanion.Diagnostics;
 using HandheldCompanion.Inputs;
 using SharpDX.XInput;
 using System;
@@ -72,7 +74,18 @@ public class XInputController : IController, IXInputController
     public override void Tick(long ticks, float delta, bool commit)
     {
         if (Inputs is null || IsBusy || !IsPlugged || _disposing || _disposed)
+        {
+            if (FseInputDiagHost.IsFrameOpen)
+            {
+                DiagSkipReason reason = Inputs is null
+                    ? DiagSkipReason.InputsNull
+                    : IsBusy ? DiagSkipReason.Busy
+                    : !IsPlugged ? DiagSkipReason.NotPlugged
+                    : DiagSkipReason.Disposing;
+                FseInputDiagHost.NoteRaw(this, DiagReadResult.Skipped, 0, reason);
+            }
             return;
+        }
 
         if (!commit)
             UpdateState();
@@ -85,7 +98,11 @@ public class XInputController : IController, IXInputController
         ButtonState.Overwrite(InjectedButtons, Inputs.ButtonState);
 
         if (Controller is null)
+        {
+            if (FseInputDiagHost.IsFrameOpen)
+                FseInputDiagHost.NoteRaw(this, DiagReadResult.NullController, 0, DiagSkipReason.None);
             return false;
+        }
 
         try
         {
@@ -129,10 +146,18 @@ public class XInputController : IController, IXInputController
             Inputs.AxisState[AxisFlags.L2] = Gamepad.LeftTrigger;
             Inputs.AxisState[AxisFlags.R2] = Gamepad.RightTrigger;
 
+            if (FseInputDiagHost.IsFrameOpen)
+                FseInputDiagHost.NoteRaw(this, DiagReadResult.Ok, 0, DiagSkipReason.None);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            try
+            {
+                if (FseInputDiagHost.IsFrameOpen)
+                    FseInputDiagHost.NoteRaw(this, DiagReadResult.Failed, ex.HResult, DiagSkipReason.None);
+            }
+            catch { }
             return false;
         }
     }
